@@ -62,9 +62,13 @@ MANIFEST_URL_DEFAULT = f"{DOWNLOAD_BASE_DEFAULT}/{MANIFEST_NAME}"
 
 CHECK_INTERVAL = 3600
 
+LAST_UP_TO_DATE_LOG_DATE = None
+
+'''
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_PATH = os.path.join(LOG_DIR, "updater.log")
+'''
 
 
 # In[ ]:
@@ -110,6 +114,14 @@ CONFIG_PATH = resolve_config_path()
 # In[ ]:
 
 
+BASE_DIR = RUNTIME_BASE_DIR
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_PATH = os.path.join(LOG_DIR, "updater.log")
+
+
+# In[ ]:
+
+
 def setup_logger():
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -146,6 +158,18 @@ def log_info(message):
 
 def log_error(message):
     LOGGER.error(message)
+
+
+# In[ ]:
+
+
+def log_up_to_date_once_per_day(message):
+    global LAST_UP_TO_DATE_LOG_DATE
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if LAST_UP_TO_DATE_LOG_DATE != today:
+        log_info(message)
+        LAST_UP_TO_DATE_LOG_DATE = today
 
 
 # In[ ]:
@@ -501,8 +525,9 @@ def run_update_cycle(manifest=None):
         local_version = config["version"]
         os_type = get_os_type()
 
-        log_info(f"Local Version: {local_version}")
-        log_info(f"OS Type: {os_type}")
+        # Only log these details during real update activity or errors
+        #log_info(f"Local Version: {local_version}")
+        #log_info(f"OS Type: {os_type}")
 
         if manifest is None:
             manifest = fetch_manifest()
@@ -511,11 +536,16 @@ def run_update_cycle(manifest=None):
             return None
 
         latest_version = manifest.get("stable_version") or manifest["stable"][os_type]["version"]
-        log_info(f"Latest Version: {latest_version}")
 
         if not is_update_available(local_version, latest_version):
-            log_info("Client is already up to date.")
+            log_up_to_date_once_per_day(
+                f"Client already up to date. local={local_version}, latest={latest_version}, os={os_type}"
+            )
             return manifest
+        
+        log_info(f"Local Version: {local_version}")
+        log_info(f"OS Type: {os_type}")
+        log_info(f"Latest Version: {latest_version}")
 
         start_time = datetime.now()
         log_info(f"===== UPDATE STARTED | from={local_version} to={latest_version} =====")
@@ -558,7 +588,9 @@ if __name__ == "__main__":
         else:
             interval = CHECK_INTERVAL
 
-        log_info(f"Sleeping for {interval} seconds before next update check")
+        # do not log sleep every cycle; it creates unnecessary noise
+        #log_info(f"Sleeping for {interval} seconds before next update check")
+        
         time.sleep(interval)
 
 
