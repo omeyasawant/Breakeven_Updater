@@ -38,6 +38,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 from html import unescape
 from urllib.parse import urljoin
@@ -50,7 +51,7 @@ from packaging import version
 # In[ ]:
 
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "client_config.json")
+#CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "client_config.json")
 
 UPDATES_INDEX_URL = "https://updates.breakeventx.com"
 MANIFEST_NAME = "sudo_manifest.json"
@@ -64,6 +65,46 @@ CHECK_INTERVAL = 3600
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_PATH = os.path.join(LOG_DIR, "updater.log")
+
+
+# In[ ]:
+
+
+def get_runtime_base_dir():
+    """
+    Returns the real folder where the updater is located.
+    Works for both:
+    - updater.py run directly
+    - PyInstaller-built .exe
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+RUNTIME_BASE_DIR = get_runtime_base_dir()
+
+def resolve_config_path():
+    """
+    Priority:
+    1. ../client_config.json relative to updater location
+    2. ./client_config.json beside updater
+    3. installPath/client_config.json if discoverable later
+    """
+    candidates = [
+        os.path.normpath(os.path.join(RUNTIME_BASE_DIR, "..", "client_config.json")),
+        os.path.normpath(os.path.join(RUNTIME_BASE_DIR, "client_config.json")),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    # default to the original intended relative path even if not found yet
+    return candidates[0]
+
+
+CONFIG_PATH = resolve_config_path()
 
 
 # In[ ]:
@@ -127,6 +168,7 @@ def get_os_type():
 
 
 def get_config():
+    log_info(f"Using client config path: {CONFIG_PATH}")
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
