@@ -1,0 +1,5 @@
+# Dependencies for Breakeven Updater service
+
+requests>=2.31
+packaging>=23.2
+psutil>=5.9

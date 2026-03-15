@@ -1,0 +1,122 @@
+name: Build Breakeven_Updater Distributables
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_suffix: windows
+            upload_path: dist/Breakeven_Updater.exe
+
+          - os: ubuntu-latest
+            artifact_suffix: linux
+            upload_path: dist/Breakeven_Updater-x86_64.AppImage
+
+          - os: macos-latest
+            artifact_suffix: macos
+            upload_path: dist/Breakeven_Updater.app.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: breakeven-updater
+          python-version: "3.11"
+          channels: conda-forge
+          channel-priority: strict
+          auto-update-conda: true
+
+      - name: Install core dependencies (conda)
+        shell: bash -l {0}
+        run: |
+          conda install -y             python="3.11"             setuptools             pip
+
+      - name: Install pip dependencies
+        shell: bash -l {0}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.3.0
+
+      - name: Build (Windows .exe)
+        if: runner.os == 'Windows'
+        shell: bash -l {0}
+        run: |
+          python -m PyInstaller --onefile updater.py             --name Breakeven_Updater             --hidden-import psutil             --hidden-import requests             --hidden-import packaging
+
+      - name: Build (macOS .app zip)
+        if: runner.os == 'macOS'
+        shell: bash -l {0}
+        run: |
+          # Build an app bundle (onedir on macOS produces dist/Breakeven_Updater.app)
+          python -m PyInstaller --onedir --windowed updater.py             --name Breakeven_Updater             --hidden-import psutil             --hidden-import requests             --hidden-import packaging
+
+          # Zip the .app for easy distribution
+          ditto -c -k --sequesterRsrc --keepParent "dist/Breakeven_Updater.app" "dist/Breakeven_Updater.app.zip"
+
+      - name: Build (Linux AppImage)
+        if: runner.os == 'Linux'
+        shell: bash -l {0}
+        run: |
+          python -m PyInstaller --onefile updater.py             --name Breakeven_Updater             --hidden-import psutil             --hidden-import requests             --hidden-import packaging
+
+          # Create AppDir layout
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin
+          cp dist/Breakeven_Updater AppDir/usr/bin/Breakeven_Updater
+
+          # Desktop entry
+          cat > AppDir/Breakeven_Updater.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Breakeven Updater
+          Exec=Breakeven_Updater
+          Icon=Breakeven_Updater
+          Categories=Utility;
+          Terminal=true
+          EOF
+
+          # Minimal 1x1 PNG icon (base64)
+          base64 -d > AppDir/Breakeven_Updater.png << 'EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGD4DwABBAEAHnLrWQAAAABJRU5ErkJggg==
+          EOF
+
+          # AppRun launcher
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/Breakeven_Updater" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          # Package AppImage
+          curl -L -o appimagetool https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          # Extract appimagetool (NO FUSE required)
+          ./appimagetool --appimage-extract
+
+          # Run the extracted binary
+          ./squashfs-root/AppRun AppDir dist/Breakeven_Updater-x86_64.AppImage
+
+          chmod +x dist/Breakeven_Updater-x86_64.AppImage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Breakeven_Updater-${{ matrix.artifact_suffix }}
+          path: ${{ matrix.upload_path }}

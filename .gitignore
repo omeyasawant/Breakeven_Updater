@@ -1,0 +1,13 @@
+dist/
+updater_dist/
+build/
+__pycache__/
+*.spec
+*.log
+.venv/
+.env
+.github_token
+node_modules/
+package-lock.json
+build_updater.js
+package.json
