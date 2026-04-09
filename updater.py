@@ -39,6 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from html import unescape
 from urllib.parse import urljoin
@@ -62,6 +63,18 @@ MANIFEST_URL_DEFAULT = f"{DOWNLOAD_BASE_DEFAULT}/{MANIFEST_NAME}"
 
 CHECK_INTERVAL = 3600
 
+HELPER_STATE_ARG = "--apply-update-state"
+RUNTIME_BASE_ENV = "BREAKEVEN_UPDATER_RUNTIME_BASE"
+SERVICE_MANIFEST_FILES = (
+    "service_manifest.json",
+    "tray_service_manifest.json",
+    "updater_service_manifest.json",
+)
+WINDOWS_DETACHED_FLAGS = (
+    getattr(subprocess, "DETACHED_PROCESS", 0)
+    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+)
+
 LAST_UP_TO_DATE_LOG_DATE = None
 
 '''
@@ -81,6 +94,10 @@ def get_runtime_base_dir():
     - updater.py run directly
     - PyInstaller-built .exe
     """
+    override_base_dir = os.environ.get(RUNTIME_BASE_ENV)
+    if override_base_dir:
+        return os.path.abspath(override_base_dir)
+
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
@@ -439,6 +456,617 @@ def download_file_verified(url, dest_path, expected_sha256):
 # In[ ]:
 
 
+def parse_helper_state_path(argv=None):
+    argv = argv or sys.argv
+
+    if HELPER_STATE_ARG not in argv:
+        return None
+
+    index = argv.index(HELPER_STATE_ARG)
+    if index + 1 >= len(argv):
+        raise RuntimeError(f"Missing state file path after {HELPER_STATE_ARG}")
+
+    return argv[index + 1]
+
+
+def normalize_fs_path(path_value):
+    return os.path.normcase(os.path.abspath(path_value))
+
+
+def is_path_within_root(path_value, root_path):
+    try:
+        return os.path.commonpath([normalize_fs_path(path_value), normalize_fs_path(root_path)]) == normalize_fs_path(root_path)
+    except Exception:
+        return False
+
+
+def build_subprocess_kwargs(detached=False):
+    kwargs = {}
+
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs["startupinfo"] = startupinfo
+        if detached:
+            kwargs["creationflags"] = WINDOWS_DETACHED_FLAGS
+    elif detached:
+        kwargs["start_new_session"] = True
+
+    return kwargs
+
+
+def truncate_for_log(value, limit=600):
+    if value is None:
+        return ""
+
+    value = str(value).strip()
+    if len(value) <= limit:
+        return value
+
+    return value[:limit] + "..."
+
+
+def format_command(command):
+    try:
+        return subprocess.list2cmdline(command)
+    except Exception:
+        return " ".join(str(part) for part in command)
+
+
+def run_command_capture(command, timeout=30):
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        **build_subprocess_kwargs(),
+    )
+
+
+def spawn_detached(command, cwd=None, env=None):
+    return subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        **build_subprocess_kwargs(detached=True),
+    )
+
+
+def resolve_manifest_target_path(manifest_path, target_path):
+    if not target_path:
+        return None
+
+    normalized_target = target_path.replace("/", os.sep)
+    if os.path.isabs(normalized_target):
+        return os.path.normpath(normalized_target)
+
+    manifest_root = os.path.dirname(os.path.dirname(manifest_path))
+    return os.path.normpath(os.path.join(manifest_root, normalized_target))
+
+
+def load_service_manifest_record(manifest_path):
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    commands = manifest.get("control", {}).get("commands", {}) or {}
+    record = {
+        "manifest_path": manifest_path,
+        "manifest_name": os.path.basename(manifest_path),
+        "name": manifest.get("name") or os.path.splitext(os.path.basename(manifest_path))[0],
+        "identifier": manifest.get("identifier") or "",
+        "service_type": manifest.get("serviceType") or "",
+        "commands": commands,
+        "binary_path": resolve_manifest_target_path(manifest_path, manifest.get("binary")),
+        "runner_path": resolve_manifest_target_path(manifest_path, manifest.get("runner")),
+        "log_file": resolve_manifest_target_path(manifest_path, manifest.get("logFile")),
+    }
+    hint_text = " ".join(
+        part.lower()
+        for part in [record["manifest_name"], record["name"], record["identifier"]]
+        if part
+    )
+    record["is_updater"] = "updater" in hint_text
+    return record
+
+
+def discover_service_manifest_records(config):
+    roots = [config.get("installPath"), config.get("serviceInstallPath")]
+    records = []
+    seen_keys = set()
+
+    for root_path in roots:
+        if not root_path:
+            continue
+
+        client_service_dir = os.path.join(root_path, "client_service")
+        for manifest_name in SERVICE_MANIFEST_FILES:
+            manifest_path = os.path.join(client_service_dir, manifest_name)
+            if not os.path.exists(manifest_path):
+                continue
+
+            try:
+                record = load_service_manifest_record(manifest_path)
+            except Exception as e:
+                log_error(f"Failed to load service manifest {manifest_path}: {e}")
+                continue
+
+            key = (
+                record["service_type"],
+                record["identifier"],
+                record["binary_path"],
+                record["runner_path"],
+            )
+            if key in seen_keys:
+                continue
+
+            seen_keys.add(key)
+            records.append(record)
+
+    if records:
+        manifest_names = ", ".join(record["manifest_name"] for record in records)
+        log_info(f"Discovered service manifests: {manifest_names}")
+    else:
+        log_info("No service manifests discovered for this install")
+
+    return records
+
+
+def get_service_status_command(record):
+    identifier = record.get("identifier", "")
+    service_type = record.get("service_type")
+
+    if service_type == "windows-service":
+        escaped = identifier.replace("'", "''")
+        return [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            (
+                f"$svc = Get-Service -Name '{escaped}' -ErrorAction SilentlyContinue; "
+                "if ($null -eq $svc) { exit 3 }; "
+                "Write-Output $svc.Status"
+            ),
+        ]
+
+    if service_type == "systemd-user-service" and identifier:
+        return ["systemctl", "--user", "is-active", identifier]
+
+    if service_type == "launch-agent" and identifier:
+        return ["launchctl", "list", identifier]
+
+    return record.get("commands", {}).get("status")
+
+
+def is_service_running(record):
+    status_command = get_service_status_command(record)
+    if not status_command:
+        return False
+
+    try:
+        result = run_command_capture(status_command, timeout=20)
+    except Exception as e:
+        log_error(f"Failed checking service status for {record['name']}: {e}")
+        return False
+
+    stdout = (result.stdout or "").strip().lower()
+    stderr = (result.stderr or "").strip().lower()
+    service_type = record.get("service_type")
+
+    if service_type == "windows-service":
+        return result.returncode == 0 and "running" in stdout
+
+    if service_type == "systemd-user-service":
+        return result.returncode == 0 and stdout == "active"
+
+    if service_type == "launch-agent":
+        return result.returncode == 0 and "could not find service" not in stdout and "could not find service" not in stderr
+
+    return result.returncode == 0
+
+
+def get_process_candidate_paths(proc):
+    candidate_paths = []
+
+    exe_path = proc.info.get("exe")
+    if exe_path:
+        candidate_paths.append(exe_path)
+
+    for item in proc.info.get("cmdline") or []:
+        if item and os.path.isabs(item):
+            candidate_paths.append(item)
+
+    normalized_paths = []
+    for path_value in candidate_paths:
+        try:
+            normalized_paths.append(normalize_fs_path(path_value))
+        except Exception:
+            continue
+
+    return normalized_paths
+
+
+def find_processes_by_targets(target_paths=None, target_roots=None, exclude_pids=None):
+    exclude_pids = set(exclude_pids or [])
+    normalized_targets = {normalize_fs_path(path_value) for path_value in (target_paths or []) if path_value}
+    normalized_roots = [normalize_fs_path(root_path) for root_path in (target_roots or []) if root_path]
+    matches = []
+
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        if proc.pid in exclude_pids:
+            continue
+
+        try:
+            proc_paths = get_process_candidate_paths(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+        exact_match = any(proc_path in normalized_targets for proc_path in proc_paths)
+        root_match = any(
+            is_path_within_root(proc_path, root_path)
+            for proc_path in proc_paths
+            for root_path in normalized_roots
+        )
+
+        if exact_match or root_match:
+            matches.append(proc)
+
+    return matches
+
+
+def find_processes_for_service_record(record, exclude_pids=None):
+    target_paths = [record.get("binary_path"), record.get("runner_path")]
+    return find_processes_by_targets(target_paths=target_paths, exclude_pids=exclude_pids)
+
+
+def terminate_processes(processes, label, timeout=30):
+    active_processes = []
+    for proc in processes:
+        try:
+            if proc.is_running():
+                active_processes.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if not active_processes:
+        return
+
+    process_ids = ", ".join(str(proc.pid) for proc in active_processes)
+    log_info(f"Stopping {label} processes: {process_ids}")
+
+    for proc in active_processes:
+        try:
+            proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    _, still_alive = psutil.wait_procs(active_processes, timeout=max(timeout / 2, 1))
+
+    for proc in still_alive:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    _, remaining = psutil.wait_procs(still_alive, timeout=max(timeout / 2, 1))
+    if remaining:
+        remaining_ids = ", ".join(str(proc.pid) for proc in remaining)
+        raise RuntimeError(f"Unable to stop {label} processes: {remaining_ids}")
+
+
+def invoke_service_action(record, action, timeout=30):
+    command = record.get("commands", {}).get(action)
+    if not command:
+        raise RuntimeError(f"Service manifest {record['manifest_path']} has no '{action}' command")
+
+    log_info(f"Running service action '{action}' for {record['name']}: {format_command(command)}")
+    result = run_command_capture(command, timeout=timeout)
+
+    stdout = truncate_for_log(result.stdout)
+    stderr = truncate_for_log(result.stderr)
+    if stdout:
+        log_info(f"Service '{record['name']}' {action} stdout: {stdout}")
+    if stderr:
+        if result.returncode == 0:
+            log_info(f"Service '{record['name']}' {action} stderr: {stderr}")
+        else:
+            log_error(f"Service '{record['name']}' {action} stderr: {stderr}")
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Service action '{action}' failed for {record['name']} with exit code {result.returncode}"
+        )
+
+
+def wait_for_pid_exit(pid, timeout=60):
+    if not pid or pid == os.getpid():
+        return
+
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                return
+        except psutil.NoSuchProcess:
+            return
+
+        time.sleep(1)
+
+    raise RuntimeError(f"Timed out waiting for process {pid} to exit")
+
+
+def wait_for_service_transition(record, should_be_running, timeout=45, exclude_pids=None):
+    deadline = time.time() + timeout
+    exclude_pids = set(exclude_pids or [])
+    service_type = record.get("service_type")
+
+    while time.time() < deadline:
+        running = is_service_running(record)
+        processes = find_processes_for_service_record(record, exclude_pids=exclude_pids)
+        has_processes = bool(processes)
+
+        if should_be_running:
+            if service_type == "launch-agent":
+                if has_processes or running:
+                    return
+            elif running or has_processes:
+                return
+        else:
+            if service_type == "launch-agent":
+                if not has_processes:
+                    return
+            elif not running and not has_processes:
+                return
+
+        time.sleep(1)
+
+    state_name = "running" if should_be_running else "stopped"
+    raise RuntimeError(f"Timed out waiting for service {record['name']} to become {state_name}")
+
+
+def get_current_program_path():
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return os.path.abspath(__file__)
+
+
+def current_program_is_managed_install(config):
+    current_program_path = get_current_program_path()
+    for root_path in [config.get("installPath"), config.get("serviceInstallPath")]:
+        if root_path and is_path_within_root(current_program_path, root_path):
+            return True
+
+    return False
+
+
+def inspect_runtime_state(config):
+    service_records = discover_service_manifest_records(config)
+    for record in service_records:
+        record["was_running"] = is_service_running(record)
+        state_label = "running" if record["was_running"] else "stopped"
+        log_info(f"Service '{record['name']}' detected as {state_label}")
+
+    dashboard_processes = find_processes_by_targets(
+        target_roots=[os.path.join(config["installPath"], "dashboard_gui")],
+        exclude_pids={os.getpid()},
+    )
+    if dashboard_processes:
+        process_ids = ", ".join(str(proc.pid) for proc in dashboard_processes)
+        log_info(f"Dashboard currently running with processes: {process_ids}")
+
+    return {
+        "service_records": service_records,
+        "dashboard_running": bool(dashboard_processes),
+    }
+
+
+def stop_dashboard_if_running(config):
+    dashboard_dir = os.path.join(config["installPath"], "dashboard_gui")
+    processes = find_processes_by_targets(
+        target_roots=[dashboard_dir],
+        exclude_pids={os.getpid()},
+    )
+
+    if not processes:
+        log_info("Dashboard is not running")
+        return False
+
+    log_info("Dashboard is running; closing it before update")
+    terminate_processes(processes, "dashboard", timeout=30)
+    return True
+
+
+def launch_dashboard_if_present(install_path):
+    dashboard_dir = os.path.join(install_path, "dashboard_gui")
+    if not os.path.isdir(dashboard_dir):
+        log_info(f"Dashboard directory not found, skipping relaunch: {dashboard_dir}")
+        return False
+
+    try:
+        if sys.platform.startswith("win"):
+            for candidate_name in ["BreakEven.exe", "BreakEven Dashboard.exe"]:
+                candidate_path = os.path.join(dashboard_dir, candidate_name)
+                if os.path.exists(candidate_path):
+                    spawn_detached([candidate_path], cwd=dashboard_dir)
+                    log_info(f"Dashboard relaunched from {candidate_path}")
+                    return True
+
+            log_info(f"No Windows dashboard executable found in {dashboard_dir}")
+            return False
+
+        if sys.platform == "darwin":
+            app_path = os.path.join(dashboard_dir, "BreakEven.app")
+            if os.path.exists(app_path):
+                spawn_detached(["open", app_path], cwd=dashboard_dir)
+                log_info(f"Dashboard relaunched from {app_path}")
+                return True
+
+            dmg_path = os.path.join(dashboard_dir, "BreakEven.dmg")
+            if os.path.exists(dmg_path):
+                spawn_detached(["open", dmg_path], cwd=dashboard_dir)
+                log_info(f"Dashboard disk image reopened from {dmg_path}")
+                return True
+
+            log_info(f"No macOS dashboard artifact found in {dashboard_dir}")
+            return False
+
+        if sys.platform.startswith("linux"):
+            executable_candidates = [
+                os.path.join(dashboard_dir, "BreakEven"),
+                os.path.join(dashboard_dir, "BreakEven.AppImage"),
+                os.path.join(dashboard_dir, "BreakEven-x86_64.AppImage"),
+            ]
+            for candidate_path in executable_candidates:
+                if not os.path.exists(candidate_path):
+                    continue
+
+                try:
+                    os.chmod(candidate_path, 0o755)
+                except Exception:
+                    pass
+
+                spawn_detached([candidate_path], cwd=dashboard_dir)
+                log_info(f"Dashboard relaunched from {candidate_path}")
+                return True
+
+            for package_name in ["BreakEven.deb", "BreakEven.rpm"]:
+                package_path = os.path.join(dashboard_dir, package_name)
+                if os.path.exists(package_path):
+                    spawn_detached(["xdg-open", package_path], cwd=dashboard_dir)
+                    log_info(f"Dashboard package reopened from {package_path}")
+                    return True
+
+            log_info(f"No Linux dashboard artifact found in {dashboard_dir}")
+            return False
+
+        log_info(f"Dashboard relaunch is not supported on platform {sys.platform}")
+        return False
+    except Exception as e:
+        log_error(f"Failed to relaunch dashboard: {e}")
+        return False
+
+
+def create_helper_copy():
+    helper_dir = tempfile.mkdtemp(prefix="breakeven_updater_helper_")
+
+    if getattr(sys, "frozen", False):
+        source_path = sys.executable
+        helper_name = os.path.basename(sys.executable)
+    else:
+        source_path = os.path.abspath(__file__)
+        helper_name = os.path.basename(__file__)
+
+    helper_path = os.path.join(helper_dir, helper_name)
+    shutil.copy2(source_path, helper_path)
+
+    if os.name != "nt":
+        try:
+            os.chmod(helper_path, 0o755)
+        except Exception:
+            pass
+
+    return helper_dir, helper_path
+
+
+def launch_update_helper(manifest, local_version, latest_version, os_type):
+    helper_dir, helper_path = create_helper_copy()
+    state_path = os.path.join(helper_dir, "update_state.json")
+    state = {
+        "manifest": manifest,
+        "local_version": local_version,
+        "latest_version": latest_version,
+        "os_type": os_type,
+        "original_pid": os.getpid(),
+        "launched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+    if getattr(sys, "frozen", False):
+        command = [helper_path, HELPER_STATE_ARG, state_path]
+    else:
+        command = [sys.executable, helper_path, HELPER_STATE_ARG, state_path]
+
+    helper_env = os.environ.copy()
+    helper_env[RUNTIME_BASE_ENV] = RUNTIME_BASE_DIR
+    spawn_detached(command, cwd=helper_dir, env=helper_env)
+
+    log_info(
+        f"Launched detached updater helper from {helper_path} "
+        f"for update {local_version} -> {latest_version}"
+    )
+
+
+def perform_coordinated_update(os_type, manifest, config, helper_state=None, runtime_state=None):
+    runtime_state = runtime_state or inspect_runtime_state(config)
+    running_services = [record for record in runtime_state["service_records"] if record.get("was_running")]
+    running_services.sort(key=lambda record: 1 if record.get("is_updater") else 0)
+
+    stopped_services = []
+    dashboard_was_running = False
+
+    try:
+        dashboard_was_running = stop_dashboard_if_running(config)
+
+        if running_services:
+            log_info(f"Stopping {len(running_services)} managed service(s) before update")
+
+        for record in running_services:
+            invoke_service_action(record, "stop", timeout=45)
+            wait_for_service_transition(record, should_be_running=False, timeout=60, exclude_pids={os.getpid()})
+            stopped_services.append(record)
+            log_info(f"Service '{record['name']}' stopped successfully")
+
+        if helper_state and helper_state.get("original_pid"):
+            log_info(f"Waiting for original updater process {helper_state['original_pid']} to exit")
+            wait_for_pid_exit(helper_state["original_pid"], timeout=60)
+
+        return install_update(os_type, manifest)
+
+    finally:
+        for record in reversed(stopped_services):
+            try:
+                invoke_service_action(record, "start", timeout=45)
+                wait_for_service_transition(record, should_be_running=True, timeout=60, exclude_pids={os.getpid()})
+                log_info(f"Service '{record['name']}' restarted successfully")
+            except Exception as restart_error:
+                log_error(f"Failed to restart service '{record['name']}': {restart_error}")
+
+        if dashboard_was_running:
+            launch_dashboard_if_present(config["installPath"])
+
+
+def run_helper_update_job(state_path):
+    with open(state_path, "r", encoding="utf-8") as f:
+        helper_state = json.load(f)
+
+    log_info(f"Updater helper started using state file: {state_path}")
+    try:
+        run_update_cycle(
+            manifest=helper_state.get("manifest"),
+            helper_mode=True,
+            helper_state=helper_state,
+        )
+    finally:
+        try:
+            os.remove(state_path)
+        except Exception:
+            pass
+
+
+# In[ ]:
+
+
 def install_update(os_type, manifest):
     config = get_config()
     install_path = config["installPath"]
@@ -470,8 +1098,7 @@ def install_update(os_type, manifest):
 
     latest_version = manifest.get("stable_version") or stable_info.get("version")
 
-    install_config_path = os.path.join(install_path, "client_config.json")
-    update_config_version_at_path(install_config_path, latest_version)
+    config_paths_to_update = [os.path.join(install_path, "client_config.json")]
 
     if "client_service" in components and service_path:
         log_info("Updating client_service files at serviceInstallPath")
@@ -505,8 +1132,10 @@ def install_update(os_type, manifest):
     
             log_info(f"Replaced service file -> {dst_file}")
 
-        service_config_path = os.path.join(service_path, "client_config.json")
-        update_config_version_at_path(service_config_path, latest_version)
+            config_paths_to_update.append(os.path.join(service_path, "client_config.json"))
+
+        for config_path in dict.fromkeys(config_paths_to_update):
+            update_config_version_at_path(config_path, latest_version)
         
     return downloaded_files
 
@@ -514,7 +1143,7 @@ def install_update(os_type, manifest):
 # In[ ]:
 
 
-def run_update_cycle(manifest=None):
+def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
     try:
         config = get_config()
 
@@ -547,10 +1176,25 @@ def run_update_cycle(manifest=None):
         log_info(f"OS Type: {os_type}")
         log_info(f"Latest Version: {latest_version}")
 
+        runtime_state = inspect_runtime_state(config)
+        if not helper_mode and (
+            current_program_is_managed_install(config)
+            or any(record.get("is_updater") and record.get("was_running") for record in runtime_state["service_records"])
+        ):
+            log_info("Managed updater runtime detected; handing off update work to detached helper")
+            launch_update_helper(manifest, local_version, latest_version, os_type)
+            raise SystemExit(0)
+
         start_time = datetime.now()
         log_info(f"===== UPDATE STARTED | from={local_version} to={latest_version} =====")
 
-        downloaded_files = install_update(os_type, manifest)
+        downloaded_files = perform_coordinated_update(
+            os_type,
+            manifest,
+            config,
+            helper_state=helper_state,
+            runtime_state=runtime_state,
+        )
         
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -577,21 +1221,26 @@ def run_update_cycle(manifest=None):
 
 
 if __name__ == "__main__":
-    log_info("Updater service started")
+    helper_state_path = parse_helper_state_path()
 
-    while True:
-        manifest = fetch_manifest()
-        manifest = run_update_cycle(manifest)
+    if helper_state_path:
+        run_helper_update_job(helper_state_path)
+    else:
+        log_info("Updater service started")
 
-        if manifest:
-            interval = manifest.get("check_interval_seconds", CHECK_INTERVAL)
-        else:
-            interval = CHECK_INTERVAL
+        while True:
+            manifest = fetch_manifest()
+            manifest = run_update_cycle(manifest)
 
-        # do not log sleep every cycle; it creates unnecessary noise
-        #log_info(f"Sleeping for {interval} seconds before next update check")
-        
-        time.sleep(interval)
+            if manifest:
+                interval = manifest.get("check_interval_seconds", CHECK_INTERVAL)
+            else:
+                interval = CHECK_INTERVAL
+
+            # do not log sleep every cycle; it creates unnecessary noise
+            #log_info(f"Sleeping for {interval} seconds before next update check")
+            
+            time.sleep(interval)
 
 
 # In[ ]:
