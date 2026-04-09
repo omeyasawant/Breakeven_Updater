@@ -1052,22 +1052,60 @@ def inspect_runtime_state(config):
         target_roots=[os.path.join(config["installPath"], "dashboard_gui")],
         exclude_pids={os.getpid()},
     )
+    dashboard_records = []
     if dashboard_processes:
         process_ids = ", ".join(str(proc.pid) for proc in dashboard_processes)
         log_info(f"Dashboard currently running with processes: {process_ids}")
+        for proc in dashboard_processes:
+            try:
+                dashboard_records.append(
+                    {
+                        "pid": proc.pid,
+                        "name": proc.info.get("name") or "",
+                        "exe": proc.info.get("exe") or "",
+                    }
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
     return {
         "service_records": service_records,
         "dashboard_running": bool(dashboard_processes),
+        "dashboard_processes": dashboard_records,
     }
 
 
-def stop_dashboard_if_running(config):
+def find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids=None):
+    dashboard_records = (runtime_state or {}).get("dashboard_processes") or []
+    process_names = {record.get("name", "").lower() for record in dashboard_records if record.get("name")}
+    exclude_pids = set(exclude_pids or [])
+    matches = []
+
+    if not process_names:
+        return matches
+
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        if proc.pid in exclude_pids:
+            continue
+        try:
+            process_name = (proc.info.get("name") or "").lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if process_name in process_names:
+            matches.append(proc)
+
+    return matches
+
+
+def stop_dashboard_if_running(config, runtime_state=None):
     dashboard_dir = os.path.join(config["installPath"], "dashboard_gui")
     processes = find_processes_by_targets(
         target_roots=[dashboard_dir],
         exclude_pids={os.getpid()},
     )
+
+    if not processes and (runtime_state or {}).get("dashboard_running"):
+        processes = find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids={os.getpid()})
 
     if not processes:
         log_info("Dashboard is not running")
@@ -1265,7 +1303,7 @@ def delete_windows_task(task_name):
         log_error(f"Failed deleting helper task {task_name}: {e}")
 
 
-def launch_update_helper(manifest, local_version, latest_version, os_type, config):
+def launch_update_helper(manifest, local_version, latest_version, os_type, config, runtime_state):
     helper_dir, helper_path = create_helper_copy(config)
     runtime_root = get_helper_runtime_root(config)
     state_path = os.path.join(helper_dir, "update_state.json")
@@ -1281,6 +1319,7 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
         "runtime_root": runtime_root,
         "bootstrap_log_path": bootstrap_log_path,
         "helper_task_name": None,
+        "runtime_state": runtime_state,
     }
 
     with open(state_path, "w", encoding="utf-8") as f:
@@ -1305,6 +1344,7 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
     startup_ok, startup_trace = wait_for_helper_startup(bootstrap_log_path, timeout=20)
     if startup_ok:
         log_info("Helper launch verified by bootstrap trace")
+        delete_windows_task(helper_launch.get("task_name"))
     else:
         trace_excerpt = truncate_for_log(startup_trace or "<no bootstrap trace>", limit=2000)
         log_error(
@@ -1355,7 +1395,7 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
             stopped_services.append(record)
             log_info(f"Service '{record['name']}' stopped successfully")
 
-        dashboard_was_running = stop_dashboard_if_running(config)
+        dashboard_was_running = stop_dashboard_if_running(config, runtime_state=runtime_state)
 
         if helper_state and helper_state.get("original_pid"):
             log_info(f"Waiting for original updater process {helper_state['original_pid']} to exit")
@@ -1530,13 +1570,17 @@ def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
         log_info(f"OS Type: {os_type}")
         log_info(f"Latest Version: {latest_version}")
 
-        runtime_state = inspect_runtime_state(config)
+        runtime_state = helper_state.get("runtime_state") if helper_mode and helper_state else None
+        if runtime_state:
+            log_info("Using preserved runtime state captured before helper handoff")
+        else:
+            runtime_state = inspect_runtime_state(config)
         if not helper_mode and (
             current_program_is_managed_install(config)
             or any(record.get("is_updater") and record.get("was_running") for record in runtime_state["service_records"])
         ):
             log_info("Managed updater runtime detected; handing off update work to detached helper")
-            launch_update_helper(manifest, local_version, latest_version, os_type, config)
+            launch_update_helper(manifest, local_version, latest_version, os_type, config, runtime_state)
             raise SystemExit(0)
 
         start_time = datetime.now()
