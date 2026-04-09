@@ -39,7 +39,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from html import unescape
 from urllib.parse import urljoin
@@ -960,8 +959,20 @@ def launch_dashboard_if_present(install_path):
         return False
 
 
-def create_helper_copy():
-    helper_dir = tempfile.mkdtemp(prefix="breakeven_updater_helper_")
+def get_helper_runtime_root(config):
+    base_root = config.get("serviceInstallPath") or config.get("installPath") or RUNTIME_BASE_DIR
+    runtime_root = os.path.join(base_root, "updater_runtime")
+    os.makedirs(runtime_root, exist_ok=True)
+    return runtime_root
+
+
+def create_helper_copy(config):
+    runtime_root = get_helper_runtime_root(config)
+    helper_dir = os.path.join(
+        runtime_root,
+        f"helper_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    )
+    os.makedirs(helper_dir, exist_ok=True)
 
     if getattr(sys, "frozen", False):
         source_path = sys.executable
@@ -1047,8 +1058,8 @@ def helper_marker_is_active(marker, max_age_seconds=300):
     return False
 
 
-def launch_update_helper(manifest, local_version, latest_version, os_type):
-    helper_dir, helper_path = create_helper_copy()
+def launch_update_helper(manifest, local_version, latest_version, os_type, config):
+    helper_dir, helper_path = create_helper_copy(config)
     state_path = os.path.join(helper_dir, "update_state.json")
     state = {
         "manifest": manifest,
@@ -1057,6 +1068,7 @@ def launch_update_helper(manifest, local_version, latest_version, os_type):
         "os_type": os_type,
         "original_pid": os.getpid(),
         "launched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "helper_dir": helper_dir,
     }
 
     with open(state_path, "w", encoding="utf-8") as f:
@@ -1279,7 +1291,7 @@ def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
             or any(record.get("is_updater") and record.get("was_running") for record in runtime_state["service_records"])
         ):
             log_info("Managed updater runtime detected; handing off update work to detached helper")
-            launch_update_helper(manifest, local_version, latest_version, os_type)
+            launch_update_helper(manifest, local_version, latest_version, os_type, config)
             raise SystemExit(0)
 
         start_time = datetime.now()
