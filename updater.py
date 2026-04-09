@@ -838,6 +838,36 @@ def is_service_running(record):
     return result.returncode == 0
 
 
+def get_windows_service_state(record):
+    identifier = record.get("identifier", "")
+    if not identifier:
+        return None
+
+    escaped = identifier.replace("'", "''")
+    command = [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-Command",
+        (
+            f"$svc = Get-Service -Name '{escaped}' -ErrorAction SilentlyContinue; "
+            "if ($null -eq $svc) { exit 3 }; "
+            "Write-Output $svc.Status"
+        ),
+    ]
+
+    try:
+        result = run_command_capture(command, timeout=20)
+    except Exception as e:
+        log_error(f"Failed reading Windows service state for {record['name']}: {e}")
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    return (result.stdout or "").strip()
+
+
 def get_process_candidate_paths(proc):
     candidate_paths = []
 
@@ -928,6 +958,38 @@ def terminate_processes(processes, label, timeout=30):
 
 
 def invoke_service_action(record, action, timeout=30):
+    if record.get("service_type") == "windows-service" and action in {"start", "stop"}:
+        service_state = (get_windows_service_state(record) or "").lower()
+        identifier = record.get("identifier") or record.get("name")
+
+        if action == "stop" and service_state == "stopped":
+            log_info(f"Service '{record['name']}' already stopped")
+            return
+        if action == "start" and service_state == "running":
+            log_info(f"Service '{record['name']}' already running")
+            return
+
+        sc_action = "stop" if action == "stop" else "start"
+        command = ["sc.exe", sc_action, identifier]
+        log_info(f"Running Windows service action '{action}' for {record['name']}: {format_command(command)}")
+        result = run_command_capture(command, timeout=timeout)
+
+        stdout = truncate_for_log(result.stdout)
+        stderr = truncate_for_log(result.stderr)
+        if stdout:
+            log_info(f"Windows service '{record['name']}' {action} stdout: {stdout}")
+        if stderr:
+            if result.returncode == 0:
+                log_info(f"Windows service '{record['name']}' {action} stderr: {stderr}")
+            else:
+                log_error(f"Windows service '{record['name']}' {action} stderr: {stderr}")
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Windows service action '{action}' failed for {record['name']} with exit code {result.returncode}"
+            )
+        return
+
     command = record.get("commands", {}).get(action)
     if not command:
         raise RuntimeError(f"Service manifest {record['manifest_path']} has no '{action}' command")
@@ -977,6 +1039,7 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
     deadline = time.time() + timeout
     exclude_pids = set(exclude_pids or [])
     service_type = record.get("service_type")
+    last_logged_state = None
 
     while time.time() < deadline:
         running = is_service_running(record)
@@ -984,6 +1047,10 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
         has_processes = bool(processes)
 
         if service_type == "windows-service":
+            current_state = get_windows_service_state(record) or "Unknown"
+            if current_state != last_logged_state:
+                log_info(f"Windows service '{record['name']}' current state: {current_state}")
+                last_logged_state = current_state
             if should_be_running and running:
                 return
             if not should_be_running and not running:
