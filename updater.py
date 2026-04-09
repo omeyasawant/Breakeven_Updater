@@ -983,6 +983,14 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
         processes = find_processes_for_service_record(record, exclude_pids=exclude_pids)
         has_processes = bool(processes)
 
+        if service_type == "windows-service":
+            if should_be_running and running:
+                return
+            if not should_be_running and not running:
+                return
+            time.sleep(1)
+            continue
+
         if should_be_running:
             if service_type == "launch-agent":
                 if has_processes or running:
@@ -1000,6 +1008,22 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
 
     state_name = "running" if should_be_running else "stopped"
     raise RuntimeError(f"Timed out waiting for service {record['name']} to become {state_name}")
+
+
+def get_service_stop_priority(record):
+    name_parts = " ".join(
+        str(part).lower()
+        for part in [record.get("name"), record.get("identifier"), record.get("manifest_name")]
+        if part
+    )
+
+    if "tray" in name_parts:
+        return 0
+    if "updater" in name_parts:
+        return 1
+    if "slave" in name_parts:
+        return 2
+    return 3
 
 
 def get_current_program_path():
@@ -1316,14 +1340,12 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
 def perform_coordinated_update(os_type, manifest, config, helper_state=None, runtime_state=None):
     runtime_state = runtime_state or inspect_runtime_state(config)
     running_services = [record for record in runtime_state["service_records"] if record.get("was_running")]
-    running_services.sort(key=lambda record: 1 if record.get("is_updater") else 0)
+    running_services.sort(key=get_service_stop_priority)
 
     stopped_services = []
     dashboard_was_running = False
 
     try:
-        dashboard_was_running = stop_dashboard_if_running(config)
-
         if running_services:
             log_info(f"Stopping {len(running_services)} managed service(s) before update")
 
@@ -1332,6 +1354,8 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
             wait_for_service_transition(record, should_be_running=False, timeout=60, exclude_pids={os.getpid()})
             stopped_services.append(record)
             log_info(f"Service '{record['name']}' stopped successfully")
+
+        dashboard_was_running = stop_dashboard_if_running(config)
 
         if helper_state and helper_state.get("original_pid"):
             log_info(f"Waiting for original updater process {helper_state['original_pid']} to exit")
