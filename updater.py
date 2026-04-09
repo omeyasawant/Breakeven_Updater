@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
+from datetime import timedelta
 from html import unescape
 from urllib.parse import urljoin
 
@@ -559,6 +560,67 @@ def spawn_detached(command, cwd=None, env=None):
         close_fds=True,
         **build_subprocess_kwargs(detached=True),
     )
+
+
+def windows_quote_arg(value):
+    return subprocess.list2cmdline([str(value)])
+
+
+def build_windows_task_command(command, env=None):
+    env = env or {}
+    env_assignments = []
+    for key, value in env.items():
+        env_assignments.append(f'set "{key}={value}"')
+
+    command_text = subprocess.list2cmdline([str(part) for part in command])
+    command_parts = env_assignments + [command_text]
+    return "cmd.exe /c " + " && ".join(command_parts)
+
+
+def launch_helper_via_schtasks(command, helper_dir, helper_env):
+    task_name = f"BreakEvenUpdaterHelper_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    task_command = build_windows_task_command(command, env={
+        RUNTIME_BASE_ENV: helper_env[RUNTIME_BASE_ENV],
+        HELPER_STATE_ENV: helper_env[HELPER_STATE_ENV],
+        HELPER_BOOTSTRAP_LOG_ENV: helper_env[HELPER_BOOTSTRAP_LOG_ENV],
+    })
+    task_start = (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")
+
+    create_command = [
+        "schtasks.exe",
+        "/Create",
+        "/F",
+        "/TN",
+        task_name,
+        "/SC",
+        "ONCE",
+        "/ST",
+        task_start,
+        "/RL",
+        "HIGHEST",
+        "/RU",
+        "SYSTEM",
+        "/TR",
+        task_command,
+    ]
+    run_command_capture(create_command, timeout=30)
+
+    run_command_capture(["schtasks.exe", "/Run", "/TN", task_name], timeout=30)
+
+    with open(helper_env[HELPER_BOOTSTRAP_LOG_ENV], "a", encoding="utf-8") as f:
+        f.write(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Scheduled helper task created: {task_name}\n"
+        )
+
+    return {"task_name": task_name, "pid": None}
+
+
+def launch_helper_process(command, helper_dir, helper_env):
+    if os.name == "nt":
+        return launch_helper_via_schtasks(command, helper_dir, helper_env)
+
+    proc = spawn_detached(command, cwd=helper_dir, env=helper_env)
+    return {"task_name": None, "pid": proc.pid}
 
 
 def resolve_manifest_target_path(manifest_path, target_path):
@@ -1087,6 +1149,16 @@ def helper_marker_is_active(marker, max_age_seconds=300):
     return False
 
 
+def delete_windows_task(task_name):
+    if not task_name or os.name != "nt":
+        return
+
+    try:
+        run_command_capture(["schtasks.exe", "/Delete", "/F", "/TN", task_name], timeout=20)
+    except Exception as e:
+        log_error(f"Failed deleting helper task {task_name}: {e}")
+
+
 def launch_update_helper(manifest, local_version, latest_version, os_type, config):
     helper_dir, helper_path = create_helper_copy(config)
     runtime_root = get_helper_runtime_root(config)
@@ -1102,6 +1174,7 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
         "helper_dir": helper_dir,
         "runtime_root": runtime_root,
         "bootstrap_log_path": bootstrap_log_path,
+        "helper_task_name": None,
     }
 
     with open(state_path, "w", encoding="utf-8") as f:
@@ -1121,12 +1194,16 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
         f.write(
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Parent preparing helper launch | state={state_path}\n"
         )
-    helper_process = spawn_detached(command, cwd=helper_dir, env=helper_env)
+    helper_launch = launch_helper_process(command, helper_dir, helper_env)
+    state["helper_task_name"] = helper_launch.get("task_name")
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
 
     write_helper_marker({
         "state_path": state_path,
         "helper_path": helper_path,
-        "helper_pid": helper_process.pid,
+        "helper_pid": helper_launch.get("pid"),
+        "helper_task_name": helper_launch.get("task_name"),
         "runtime_root": runtime_root,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "created_ts": time.time(),
@@ -1136,7 +1213,12 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
 
     log_info(
         f"Launched detached updater helper from {helper_path} "
-        f"for update {local_version} -> {latest_version} with pid {helper_process.pid}"
+        f"for update {local_version} -> {latest_version}"
+        + (
+            f" with pid {helper_launch['pid']}"
+            if helper_launch.get("pid")
+            else f" using task {helper_launch['task_name']}"
+        )
     )
     log_info(f"Helper bootstrap trace path: {bootstrap_log_path}")
 
@@ -1199,6 +1281,7 @@ def run_helper_update_job(state_path):
         )
     finally:
         write_bootstrap_trace("Helper mode finishing")
+        delete_windows_task(helper_state.get("helper_task_name"))
         clear_helper_marker(helper_state=helper_state)
         try:
             os.remove(state_path)
