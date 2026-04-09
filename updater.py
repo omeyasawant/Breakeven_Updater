@@ -65,6 +65,7 @@ CHECK_INTERVAL = 3600
 HELPER_STATE_ARG = "--apply-update-state"
 RUNTIME_BASE_ENV = "BREAKEVEN_UPDATER_RUNTIME_BASE"
 HELPER_STATE_ENV = "BREAKEVEN_UPDATER_STATE_PATH"
+HELPER_BOOTSTRAP_LOG_ENV = "BREAKEVEN_UPDATER_BOOTSTRAP_LOG"
 SERVICE_MANIFEST_FILES = (
     "service_manifest.json",
     "tray_service_manifest.json",
@@ -73,9 +74,24 @@ SERVICE_MANIFEST_FILES = (
 WINDOWS_DETACHED_FLAGS = (
     getattr(subprocess, "DETACHED_PROCESS", 0)
     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
 )
 
 LAST_UP_TO_DATE_LOG_DATE = None
+
+
+def write_bootstrap_trace(message):
+    bootstrap_log_path = os.environ.get(HELPER_BOOTSTRAP_LOG_ENV)
+    if not bootstrap_log_path:
+        return
+
+    try:
+        os.makedirs(os.path.dirname(bootstrap_log_path), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(bootstrap_log_path, "a", encoding="utf-8") as f:
+            f.write(f"{timestamp} | {message}\n")
+    except Exception:
+        pass
 
 '''
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -96,10 +112,13 @@ def get_runtime_base_dir():
     """
     override_base_dir = os.environ.get(RUNTIME_BASE_ENV)
     if override_base_dir:
+        write_bootstrap_trace(f"Using runtime base override: {override_base_dir}")
         return os.path.abspath(override_base_dir)
 
     if getattr(sys, "frozen", False):
+        write_bootstrap_trace(f"Using frozen executable runtime base: {sys.executable}")
         return os.path.dirname(os.path.abspath(sys.executable))
+    write_bootstrap_trace(f"Using script runtime base: {__file__}")
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -141,6 +160,7 @@ LOG_PATH = os.path.join(LOG_DIR, "updater.log")
 
 def setup_logger():
     os.makedirs(LOG_DIR, exist_ok=True)
+    write_bootstrap_trace(f"Initializing logger at: {LOG_PATH}")
 
     logger = logging.getLogger("breakeven_updater")
     logger.setLevel(logging.INFO)
@@ -209,6 +229,7 @@ def get_os_type():
 
 
 def get_config():
+    write_bootstrap_trace(f"Loading config from: {CONFIG_PATH}")
     log_info(f"Using client config path: {CONFIG_PATH}")
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -993,12 +1014,20 @@ def create_helper_copy(config):
     return helper_dir, helper_path
 
 
-def get_helper_marker_path():
-    return os.path.join(LOG_DIR, "updater_helper_pending.json")
+def get_helper_marker_path(config=None, helper_state=None):
+    if helper_state and helper_state.get("runtime_root"):
+        runtime_root = helper_state["runtime_root"]
+    elif config is not None:
+        runtime_root = get_helper_runtime_root(config)
+    else:
+        runtime_root = os.path.join(RUNTIME_BASE_DIR, "updater_runtime")
+
+    os.makedirs(runtime_root, exist_ok=True)
+    return os.path.join(runtime_root, "updater_helper_pending.json")
 
 
-def read_helper_marker():
-    marker_path = get_helper_marker_path()
+def read_helper_marker(config=None, helper_state=None):
+    marker_path = get_helper_marker_path(config=config, helper_state=helper_state)
     if not os.path.exists(marker_path):
         return None
 
@@ -1012,8 +1041,8 @@ def read_helper_marker():
         return None
 
 
-def clear_helper_marker():
-    marker_path = get_helper_marker_path()
+def clear_helper_marker(config=None, helper_state=None):
+    marker_path = get_helper_marker_path(config=config, helper_state=helper_state)
     if os.path.exists(marker_path):
         try:
             os.remove(marker_path)
@@ -1021,8 +1050,8 @@ def clear_helper_marker():
             log_error(f"Failed removing helper marker {marker_path}: {e}")
 
 
-def write_helper_marker(marker):
-    marker_path = get_helper_marker_path()
+def write_helper_marker(marker, config=None, helper_state=None):
+    marker_path = get_helper_marker_path(config=config, helper_state=helper_state)
     os.makedirs(os.path.dirname(marker_path), exist_ok=True)
     with open(marker_path, "w", encoding="utf-8") as f:
         json.dump(marker, f)
@@ -1060,7 +1089,9 @@ def helper_marker_is_active(marker, max_age_seconds=300):
 
 def launch_update_helper(manifest, local_version, latest_version, os_type, config):
     helper_dir, helper_path = create_helper_copy(config)
+    runtime_root = get_helper_runtime_root(config)
     state_path = os.path.join(helper_dir, "update_state.json")
+    bootstrap_log_path = os.path.join(helper_dir, "helper_bootstrap.log")
     state = {
         "manifest": manifest,
         "local_version": local_version,
@@ -1069,6 +1100,8 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
         "original_pid": os.getpid(),
         "launched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "helper_dir": helper_dir,
+        "runtime_root": runtime_root,
+        "bootstrap_log_path": bootstrap_log_path,
     }
 
     with open(state_path, "w", encoding="utf-8") as f:
@@ -1082,22 +1115,30 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
     helper_env = os.environ.copy()
     helper_env[RUNTIME_BASE_ENV] = RUNTIME_BASE_DIR
     helper_env[HELPER_STATE_ENV] = state_path
+    helper_env[HELPER_BOOTSTRAP_LOG_ENV] = bootstrap_log_path
+    write_bootstrap_trace(f"Preparing helper launch from {helper_path}")
+    with open(bootstrap_log_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Parent preparing helper launch | state={state_path}\n"
+        )
     helper_process = spawn_detached(command, cwd=helper_dir, env=helper_env)
 
     write_helper_marker({
         "state_path": state_path,
         "helper_path": helper_path,
         "helper_pid": helper_process.pid,
+        "runtime_root": runtime_root,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "created_ts": time.time(),
         "local_version": local_version,
         "latest_version": latest_version,
-    })
+    }, config=config)
 
     log_info(
         f"Launched detached updater helper from {helper_path} "
         f"for update {local_version} -> {latest_version} with pid {helper_process.pid}"
     )
+    log_info(f"Helper bootstrap trace path: {bootstrap_log_path}")
 
 
 def perform_coordinated_update(os_type, manifest, config, helper_state=None, runtime_state=None):
@@ -1140,10 +1181,16 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
 
 
 def run_helper_update_job(state_path):
+    write_bootstrap_trace(f"Entered helper mode with state file: {state_path}")
     with open(state_path, "r", encoding="utf-8") as f:
         helper_state = json.load(f)
 
+    write_bootstrap_trace("Helper state file loaded successfully")
     log_info(f"Updater helper started using state file: {state_path}")
+    log_info(
+        f"Helper runtime paths | runtime_base={RUNTIME_BASE_DIR} | "
+        f"config_path={CONFIG_PATH} | log_path={LOG_PATH}"
+    )
     try:
         run_update_cycle(
             manifest=helper_state.get("manifest"),
@@ -1151,7 +1198,8 @@ def run_helper_update_job(state_path):
             helper_state=helper_state,
         )
     finally:
-        clear_helper_marker()
+        write_bootstrap_trace("Helper mode finishing")
+        clear_helper_marker(helper_state=helper_state)
         try:
             os.remove(state_path)
         except Exception:
@@ -1242,7 +1290,7 @@ def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
         config = get_config()
 
         if not helper_mode:
-            helper_marker = read_helper_marker()
+            helper_marker = read_helper_marker(config=config)
             if helper_marker and helper_marker_is_active(helper_marker):
                 helper_pid = helper_marker.get("helper_pid")
                 log_info(
@@ -1254,7 +1302,7 @@ def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
 
             if helper_marker:
                 log_info("Found stale helper marker; clearing it and continuing")
-                clear_helper_marker()
+                clear_helper_marker(config=config)
 
         if not config.get("autoUpdate", True):
             log_info("Auto update disabled in client_config.json")
@@ -1331,6 +1379,10 @@ def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
 
 if __name__ == "__main__":
     helper_state_path = parse_helper_state_path()
+    write_bootstrap_trace(
+        "Process entrypoint reached"
+        + (f" with helper state {helper_state_path}" if helper_state_path else " in service mode")
+    )
 
     if helper_state_path:
         run_helper_update_job(helper_state_path)
