@@ -1040,17 +1040,32 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
     exclude_pids = set(exclude_pids or [])
     service_type = record.get("service_type")
     last_logged_state = None
+    last_progress_bucket = -1
+    target_state_name = "running" if should_be_running else "stopped"
+
+    log_info(
+        f"Waiting for service '{record['name']}' to become {target_state_name} "
+        f"(timeout={timeout}s)"
+    )
 
     while time.time() < deadline:
         running = is_service_running(record)
         processes = find_processes_for_service_record(record, exclude_pids=exclude_pids)
         has_processes = bool(processes)
+        elapsed_seconds = int(timeout - max(deadline - time.time(), 0))
 
         if service_type == "windows-service":
             current_state = get_windows_service_state(record) or "Unknown"
             if current_state != last_logged_state:
                 log_info(f"Windows service '{record['name']}' current state: {current_state}")
                 last_logged_state = current_state
+            progress_bucket = elapsed_seconds // 5
+            if progress_bucket != last_progress_bucket:
+                log_info(
+                    f"Service '{record['name']}' wait progress: elapsed={elapsed_seconds}s, "
+                    f"target={target_state_name}, current_state={current_state}"
+                )
+                last_progress_bucket = progress_bucket
             if should_be_running and running:
                 return
             if not should_be_running and not running:
@@ -1166,18 +1181,22 @@ def find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids=None
 
 def stop_dashboard_if_running(config, runtime_state=None):
     dashboard_dir = os.path.join(config["installPath"], "dashboard_gui")
+    log_info(f"Checking dashboard processes under: {dashboard_dir}")
     processes = find_processes_by_targets(
         target_roots=[dashboard_dir],
         exclude_pids={os.getpid()},
     )
 
     if not processes and (runtime_state or {}).get("dashboard_running"):
+        log_info("Dashboard was marked running before helper handoff; retrying by preserved process names")
         processes = find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids={os.getpid()})
 
     if not processes:
         log_info("Dashboard is not running")
         return False
 
+    dashboard_process_ids = ", ".join(str(proc.pid) for proc in processes)
+    log_info(f"Dashboard candidate processes selected for stop: {dashboard_process_ids}")
     log_info("Dashboard is running; closing it before update")
     terminate_processes(processes, "dashboard", timeout=30)
     return True
@@ -1455,19 +1474,27 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
     try:
         if running_services:
             log_info(f"Stopping {len(running_services)} managed service(s) before update")
+            ordered_names = ", ".join(record["name"] for record in running_services)
+            log_info(f"Managed service stop order: {ordered_names}")
+        else:
+            log_info("No managed services were marked running before update")
 
-        for record in running_services:
+        for index, record in enumerate(running_services, start=1):
+            log_info(f"Service stop phase {index}/{len(running_services)} starting for '{record['name']}'")
             invoke_service_action(record, "stop", timeout=45)
             wait_for_service_transition(record, should_be_running=False, timeout=60, exclude_pids={os.getpid()})
             stopped_services.append(record)
             log_info(f"Service '{record['name']}' stopped successfully")
 
+        log_info("Managed service stop phase complete; proceeding to dashboard shutdown")
         dashboard_was_running = stop_dashboard_if_running(config, runtime_state=runtime_state)
+        log_info(f"Dashboard shutdown phase complete; dashboard_was_running={dashboard_was_running}")
 
         if helper_state and helper_state.get("original_pid"):
             log_info(f"Waiting for original updater process {helper_state['original_pid']} to exit")
             wait_for_pid_exit(helper_state["original_pid"], timeout=60)
 
+        log_info("Beginning install/update phase after service and dashboard shutdown")
         return install_update(os_type, manifest)
 
     finally:
