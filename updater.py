@@ -549,6 +549,39 @@ def run_command_capture(command, timeout=30):
     )
 
 
+def append_helper_bootstrap_log(log_path, message):
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    except Exception:
+        pass
+
+
+def run_command_checked(command, timeout=30, context=None, log_path=None):
+    result = run_command_capture(command, timeout=timeout)
+
+    context = context or format_command(command)
+    stdout = truncate_for_log(result.stdout)
+    stderr = truncate_for_log(result.stderr)
+    if stdout:
+        log_info(f"{context} stdout: {stdout}")
+        if log_path:
+            append_helper_bootstrap_log(log_path, f"{context} stdout: {stdout}")
+    if stderr:
+        if result.returncode == 0:
+            log_info(f"{context} stderr: {stderr}")
+        else:
+            log_error(f"{context} stderr: {stderr}")
+        if log_path:
+            append_helper_bootstrap_log(log_path, f"{context} stderr: {stderr}")
+
+    if result.returncode != 0:
+        raise RuntimeError(f"{context} failed with exit code {result.returncode}")
+
+    return result
+
+
 def spawn_detached(command, cwd=None, env=None):
     return subprocess.Popen(
         command,
@@ -579,6 +612,7 @@ def build_windows_task_command(command, env=None):
 
 def launch_helper_via_schtasks(command, helper_dir, helper_env):
     task_name = f"BreakEvenUpdaterHelper_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    bootstrap_log_path = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
     task_command = build_windows_task_command(command, env={
         RUNTIME_BASE_ENV: helper_env[RUNTIME_BASE_ENV],
         HELPER_STATE_ENV: helper_env[HELPER_STATE_ENV],
@@ -603,14 +637,29 @@ def launch_helper_via_schtasks(command, helper_dir, helper_env):
         "/TR",
         task_command,
     ]
-    run_command_capture(create_command, timeout=30)
+    append_helper_bootstrap_log(bootstrap_log_path, f"Creating scheduled helper task: {task_name}")
+    run_command_checked(
+        create_command,
+        timeout=30,
+        context=f"schtasks create {task_name}",
+        log_path=bootstrap_log_path,
+    )
 
-    run_command_capture(["schtasks.exe", "/Run", "/TN", task_name], timeout=30)
+    run_command_checked(
+        ["schtasks.exe", "/Run", "/TN", task_name],
+        timeout=30,
+        context=f"schtasks run {task_name}",
+        log_path=bootstrap_log_path,
+    )
 
-    with open(helper_env[HELPER_BOOTSTRAP_LOG_ENV], "a", encoding="utf-8") as f:
-        f.write(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Scheduled helper task created: {task_name}\n"
-        )
+    run_command_checked(
+        ["schtasks.exe", "/Query", "/TN", task_name, "/V", "/FO", "LIST"],
+        timeout=30,
+        context=f"schtasks query {task_name}",
+        log_path=bootstrap_log_path,
+    )
+
+    append_helper_bootstrap_log(bootstrap_log_path, f"Scheduled helper task created: {task_name}")
 
     return {"task_name": task_name, "pid": None}
 
@@ -621,6 +670,37 @@ def launch_helper_process(command, helper_dir, helper_env):
 
     proc = spawn_detached(command, cwd=helper_dir, env=helper_env)
     return {"task_name": None, "pid": proc.pid}
+
+
+def wait_for_helper_startup(bootstrap_log_path, timeout=20):
+    deadline = time.time() + timeout
+    success_markers = [
+        "Process entrypoint reached",
+        "Entered helper mode",
+        "Helper state file loaded successfully",
+    ]
+
+    while time.time() < deadline:
+        if os.path.exists(bootstrap_log_path):
+            try:
+                with open(bootstrap_log_path, "r", encoding="utf-8") as f:
+                    contents = f.read()
+            except Exception:
+                contents = ""
+
+            if any(marker in contents for marker in success_markers):
+                return True, contents
+
+        time.sleep(1)
+
+    if os.path.exists(bootstrap_log_path):
+        try:
+            with open(bootstrap_log_path, "r", encoding="utf-8") as f:
+                return False, f.read()
+        except Exception:
+            pass
+
+    return False, ""
 
 
 def resolve_manifest_target_path(manifest_path, target_path):
@@ -1190,14 +1270,22 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
     helper_env[HELPER_STATE_ENV] = state_path
     helper_env[HELPER_BOOTSTRAP_LOG_ENV] = bootstrap_log_path
     write_bootstrap_trace(f"Preparing helper launch from {helper_path}")
-    with open(bootstrap_log_path, "a", encoding="utf-8") as f:
-        f.write(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Parent preparing helper launch | state={state_path}\n"
-        )
+    append_helper_bootstrap_log(bootstrap_log_path, f"Parent preparing helper launch | state={state_path}")
     helper_launch = launch_helper_process(command, helper_dir, helper_env)
     state["helper_task_name"] = helper_launch.get("task_name")
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f)
+
+    startup_ok, startup_trace = wait_for_helper_startup(bootstrap_log_path, timeout=20)
+    if startup_ok:
+        log_info("Helper launch verified by bootstrap trace")
+    else:
+        trace_excerpt = truncate_for_log(startup_trace or "<no bootstrap trace>", limit=2000)
+        log_error(
+            "Helper launch could not be verified within 20 seconds. "
+            f"Bootstrap trace: {trace_excerpt}"
+        )
+        raise RuntimeError("Helper launch verification failed")
 
     write_helper_marker({
         "state_path": state_path,
