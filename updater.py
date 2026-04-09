@@ -601,15 +601,25 @@ def windows_quote_arg(value):
 
 def create_windows_helper_launcher(helper_dir, command, helper_env):
     launcher_path = os.path.join(helper_dir, "launch_helper.cmd")
-    command_text = subprocess.list2cmdline([str(part) for part in command])
+    program_path = str(command[0])
+    command_args = [str(part) for part in command[1:]]
+    quoted_program = windows_quote_arg(program_path)
+    quoted_args = " ".join(windows_quote_arg(arg) for arg in command_args)
+    bootstrap_log = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
     lines = [
         "@echo off",
         "setlocal",
         f'set "{RUNTIME_BASE_ENV}={helper_env[RUNTIME_BASE_ENV]}"',
         f'set "{HELPER_STATE_ENV}={helper_env[HELPER_STATE_ENV]}"',
         f'set "{HELPER_BOOTSTRAP_LOG_ENV}={helper_env[HELPER_BOOTSTRAP_LOG_ENV]}"',
+        f'echo %date% %time% ^| Launcher entrypoint reached>>"{bootstrap_log}"',
+        f'echo %date% %time% ^| Launcher working directory {helper_dir}>>"{bootstrap_log}"',
+        f'if not exist {quoted_program} echo %date% %time% ^| Helper executable missing: {program_path}>>"{bootstrap_log}"',
         f'cd /d "{helper_dir}"',
-        command_text,
+        f'echo %date% %time% ^| Launching helper executable {program_path}>>"{bootstrap_log}"',
+        f'start "" /b {quoted_program} {quoted_args}',
+        f'echo %date% %time% ^| START command exit code %ERRORLEVEL%>>"{bootstrap_log}"',
+        "exit /b %ERRORLEVEL%",
     ]
     with open(launcher_path, "w", encoding="utf-8") as f:
         f.write("\r\n".join(lines) + "\r\n")
@@ -677,6 +687,8 @@ def launch_helper_process(command, helper_dir, helper_env):
 def wait_for_helper_startup(bootstrap_log_path, timeout=20):
     deadline = time.time() + timeout
     success_markers = [
+        "Launcher entrypoint reached",
+        "Launching helper executable",
         "Process entrypoint reached",
         "Entered helper mode",
         "Helper state file loaded successfully",
@@ -1481,14 +1493,14 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
-    startup_ok, startup_trace = wait_for_helper_startup(bootstrap_log_path, timeout=20)
+    startup_ok, startup_trace = wait_for_helper_startup(bootstrap_log_path, timeout=45)
     if startup_ok:
         log_info("Helper launch verified by bootstrap trace")
         delete_windows_task(helper_launch.get("task_name"))
     else:
         trace_excerpt = truncate_for_log(startup_trace or "<no bootstrap trace>", limit=2000)
         log_error(
-            "Helper launch could not be verified within 20 seconds. "
+            "Helper launch could not be verified within 45 seconds. "
             f"Bootstrap trace: {trace_excerpt}"
         )
         raise RuntimeError("Helper launch verification failed")
