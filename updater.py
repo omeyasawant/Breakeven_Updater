@@ -65,6 +65,7 @@ CHECK_INTERVAL = 3600
 
 HELPER_STATE_ARG = "--apply-update-state"
 RUNTIME_BASE_ENV = "BREAKEVEN_UPDATER_RUNTIME_BASE"
+HELPER_STATE_ENV = "BREAKEVEN_UPDATER_STATE_PATH"
 SERVICE_MANIFEST_FILES = (
     "service_manifest.json",
     "tray_service_manifest.json",
@@ -458,6 +459,10 @@ def download_file_verified(url, dest_path, expected_sha256):
 
 def parse_helper_state_path(argv=None):
     argv = argv or sys.argv
+
+    env_state_path = os.environ.get(HELPER_STATE_ENV)
+    if env_state_path:
+        return env_state_path
 
     if HELPER_STATE_ARG not in argv:
         return None
@@ -977,6 +982,71 @@ def create_helper_copy():
     return helper_dir, helper_path
 
 
+def get_helper_marker_path():
+    return os.path.join(LOG_DIR, "updater_helper_pending.json")
+
+
+def read_helper_marker():
+    marker_path = get_helper_marker_path()
+    if not os.path.exists(marker_path):
+        return None
+
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        marker["marker_path"] = marker_path
+        return marker
+    except Exception as e:
+        log_error(f"Failed reading helper marker {marker_path}: {e}")
+        return None
+
+
+def clear_helper_marker():
+    marker_path = get_helper_marker_path()
+    if os.path.exists(marker_path):
+        try:
+            os.remove(marker_path)
+        except Exception as e:
+            log_error(f"Failed removing helper marker {marker_path}: {e}")
+
+
+def write_helper_marker(marker):
+    marker_path = get_helper_marker_path()
+    os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+    with open(marker_path, "w", encoding="utf-8") as f:
+        json.dump(marker, f)
+
+
+def is_process_alive(pid):
+    if not pid:
+        return False
+
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def helper_marker_is_active(marker, max_age_seconds=300):
+    if not marker:
+        return False
+
+    state_path = marker.get("state_path")
+    helper_pid = marker.get("helper_pid")
+    created_ts = marker.get("created_ts")
+
+    if helper_pid and is_process_alive(helper_pid):
+        return True
+
+    if state_path and os.path.exists(state_path):
+        if created_ts is None:
+            return True
+        return (time.time() - created_ts) <= max_age_seconds
+
+    return False
+
+
 def launch_update_helper(manifest, local_version, latest_version, os_type):
     helper_dir, helper_path = create_helper_copy()
     state_path = os.path.join(helper_dir, "update_state.json")
@@ -999,11 +1069,22 @@ def launch_update_helper(manifest, local_version, latest_version, os_type):
 
     helper_env = os.environ.copy()
     helper_env[RUNTIME_BASE_ENV] = RUNTIME_BASE_DIR
-    spawn_detached(command, cwd=helper_dir, env=helper_env)
+    helper_env[HELPER_STATE_ENV] = state_path
+    helper_process = spawn_detached(command, cwd=helper_dir, env=helper_env)
+
+    write_helper_marker({
+        "state_path": state_path,
+        "helper_path": helper_path,
+        "helper_pid": helper_process.pid,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created_ts": time.time(),
+        "local_version": local_version,
+        "latest_version": latest_version,
+    })
 
     log_info(
         f"Launched detached updater helper from {helper_path} "
-        f"for update {local_version} -> {latest_version}"
+        f"for update {local_version} -> {latest_version} with pid {helper_process.pid}"
     )
 
 
@@ -1058,6 +1139,7 @@ def run_helper_update_job(state_path):
             helper_state=helper_state,
         )
     finally:
+        clear_helper_marker()
         try:
             os.remove(state_path)
         except Exception:
@@ -1146,6 +1228,21 @@ def install_update(os_type, manifest):
 def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
     try:
         config = get_config()
+
+        if not helper_mode:
+            helper_marker = read_helper_marker()
+            if helper_marker and helper_marker_is_active(helper_marker):
+                helper_pid = helper_marker.get("helper_pid")
+                log_info(
+                    "Update helper is already in progress"
+                    + (f" with pid {helper_pid}" if helper_pid else "")
+                    + "; skipping this cycle"
+                )
+                return manifest
+
+            if helper_marker:
+                log_info("Found stale helper marker; clearing it and continuing")
+                clear_helper_marker()
 
         if not config.get("autoUpdate", True):
             log_info("Auto update disabled in client_config.json")
