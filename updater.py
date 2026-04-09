@@ -1179,9 +1179,8 @@ def find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids=None
     return matches
 
 
-def stop_dashboard_if_running(config, runtime_state=None):
+def collect_dashboard_processes(config, runtime_state=None):
     dashboard_dir = os.path.join(config["installPath"], "dashboard_gui")
-    log_info(f"Checking dashboard processes under: {dashboard_dir}")
     processes = find_processes_by_targets(
         target_roots=[dashboard_dir],
         exclude_pids={os.getpid()},
@@ -1190,6 +1189,13 @@ def stop_dashboard_if_running(config, runtime_state=None):
     if not processes and (runtime_state or {}).get("dashboard_running"):
         log_info("Dashboard was marked running before helper handoff; retrying by preserved process names")
         processes = find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids={os.getpid()})
+
+    return dashboard_dir, processes
+
+
+def stop_dashboard_if_running(config, runtime_state=None):
+    dashboard_dir, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
+    log_info(f"Checking dashboard processes under: {dashboard_dir}")
 
     if not processes:
         log_info("Dashboard is not running")
@@ -1200,6 +1206,54 @@ def stop_dashboard_if_running(config, runtime_state=None):
     log_info("Dashboard is running; closing it before update")
     terminate_processes(processes, "dashboard", timeout=30)
     return True
+
+
+def ensure_dashboard_stopped(config, runtime_state=None, max_attempts=3):
+    dashboard_dir, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
+    was_running = bool(processes)
+
+    if not was_running:
+        log_info(f"Dashboard is not running under: {dashboard_dir}")
+        return False
+
+    for attempt in range(1, max_attempts + 1):
+        process_ids = ", ".join(str(proc.pid) for proc in processes)
+        log_info(
+            f"Dashboard stop attempt {attempt}/{max_attempts} with candidate processes: {process_ids}"
+        )
+        terminate_processes(processes, "dashboard", timeout=30)
+
+        _, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
+        if not processes:
+            log_info("Dashboard confirmed stopped")
+            return True
+
+        remaining_ids = ", ".join(str(proc.pid) for proc in processes)
+        log_error(f"Dashboard still running after stop attempt {attempt}: {remaining_ids}")
+
+    raise RuntimeError("Dashboard remained running after all stop attempts")
+
+
+def ensure_service_stopped(record, timeout=60, max_attempts=3):
+    for attempt in range(1, max_attempts + 1):
+        current_state = get_windows_service_state(record) if record.get("service_type") == "windows-service" else None
+        log_info(
+            f"Service '{record['name']}' stop verification attempt {attempt}/{max_attempts}"
+            + (f" current_state={current_state}" if current_state else "")
+        )
+
+        try:
+            wait_for_service_transition(record, should_be_running=False, timeout=timeout, exclude_pids={os.getpid()})
+            log_info(f"Service '{record['name']}' stopped successfully")
+            return
+        except Exception as e:
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"Service '{record['name']}' did not stop after {max_attempts} attempts: {e}"
+                ) from e
+
+            log_error(f"Service '{record['name']}' stop verification failed on attempt {attempt}: {e}")
+            invoke_service_action(record, "stop", timeout=45)
 
 
 def launch_dashboard_if_present(install_path):
@@ -1468,7 +1522,7 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
     running_services = [record for record in runtime_state["service_records"] if record.get("was_running")]
     running_services.sort(key=get_service_stop_priority)
 
-    stopped_services = []
+    services_to_restart = []
     dashboard_was_running = False
 
     try:
@@ -1480,15 +1534,18 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
             log_info("No managed services were marked running before update")
 
         for index, record in enumerate(running_services, start=1):
-            log_info(f"Service stop phase {index}/{len(running_services)} starting for '{record['name']}'")
+            log_info(f"Service stop signal phase {index}/{len(running_services)} starting for '{record['name']}'")
             invoke_service_action(record, "stop", timeout=45)
-            wait_for_service_transition(record, should_be_running=False, timeout=60, exclude_pids={os.getpid()})
-            stopped_services.append(record)
-            log_info(f"Service '{record['name']}' stopped successfully")
+            services_to_restart.append(record)
+            log_info(f"Service '{record['name']}' stop command issued")
 
-        log_info("Managed service stop phase complete; proceeding to dashboard shutdown")
-        dashboard_was_running = stop_dashboard_if_running(config, runtime_state=runtime_state)
+        log_info("All managed service stop commands issued; proceeding to dashboard shutdown")
+        dashboard_was_running = ensure_dashboard_stopped(config, runtime_state=runtime_state, max_attempts=3)
         log_info(f"Dashboard shutdown phase complete; dashboard_was_running={dashboard_was_running}")
+
+        for index, record in enumerate(services_to_restart, start=1):
+            log_info(f"Service stop wait phase {index}/{len(services_to_restart)} waiting for '{record['name']}'")
+            ensure_service_stopped(record, timeout=60, max_attempts=3)
 
         if helper_state and helper_state.get("original_pid"):
             log_info(f"Waiting for original updater process {helper_state['original_pid']} to exit")
@@ -1498,7 +1555,7 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
         return install_update(os_type, manifest)
 
     finally:
-        for record in reversed(stopped_services):
+        for record in reversed(services_to_restart):
             try:
                 invoke_service_action(record, "start", timeout=45)
                 wait_for_service_transition(record, should_be_running=True, timeout=60, exclude_pids={os.getpid()})
