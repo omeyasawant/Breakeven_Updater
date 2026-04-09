@@ -599,25 +599,27 @@ def windows_quote_arg(value):
     return subprocess.list2cmdline([str(value)])
 
 
-def build_windows_task_command(command, env=None):
-    env = env or {}
-    env_assignments = []
-    for key, value in env.items():
-        env_assignments.append(f'set "{key}={value}"')
-
+def create_windows_helper_launcher(helper_dir, command, helper_env):
+    launcher_path = os.path.join(helper_dir, "launch_helper.cmd")
     command_text = subprocess.list2cmdline([str(part) for part in command])
-    command_parts = env_assignments + [command_text]
-    return "cmd.exe /c " + " && ".join(command_parts)
+    lines = [
+        "@echo off",
+        "setlocal",
+        f'set "{RUNTIME_BASE_ENV}={helper_env[RUNTIME_BASE_ENV]}"',
+        f'set "{HELPER_STATE_ENV}={helper_env[HELPER_STATE_ENV]}"',
+        f'set "{HELPER_BOOTSTRAP_LOG_ENV}={helper_env[HELPER_BOOTSTRAP_LOG_ENV]}"',
+        f'cd /d "{helper_dir}"',
+        command_text,
+    ]
+    with open(launcher_path, "w", encoding="utf-8") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    return launcher_path
 
 
 def launch_helper_via_schtasks(command, helper_dir, helper_env):
     task_name = f"BreakEvenUpdaterHelper_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
     bootstrap_log_path = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
-    task_command = build_windows_task_command(command, env={
-        RUNTIME_BASE_ENV: helper_env[RUNTIME_BASE_ENV],
-        HELPER_STATE_ENV: helper_env[HELPER_STATE_ENV],
-        HELPER_BOOTSTRAP_LOG_ENV: helper_env[HELPER_BOOTSTRAP_LOG_ENV],
-    })
+    launcher_path = create_windows_helper_launcher(helper_dir, command, helper_env)
     task_start = (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")
 
     create_command = [
@@ -635,9 +637,9 @@ def launch_helper_via_schtasks(command, helper_dir, helper_env):
         "/RU",
         "SYSTEM",
         "/TR",
-        task_command,
+        launcher_path,
     ]
-    append_helper_bootstrap_log(bootstrap_log_path, f"Creating scheduled helper task: {task_name}")
+    append_helper_bootstrap_log(bootstrap_log_path, f"Creating scheduled helper task: {task_name} -> {launcher_path}")
     run_command_checked(
         create_command,
         timeout=30,
@@ -661,7 +663,7 @@ def launch_helper_via_schtasks(command, helper_dir, helper_env):
 
     append_helper_bootstrap_log(bootstrap_log_path, f"Scheduled helper task created: {task_name}")
 
-    return {"task_name": task_name, "pid": None}
+    return {"task_name": task_name, "pid": None, "launcher_path": launcher_path}
 
 
 def launch_helper_process(command, helper_dir, helper_env):
