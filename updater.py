@@ -880,6 +880,33 @@ def get_windows_service_state(record):
     return (result.stdout or "").strip()
 
 
+def list_service_processes(record, exclude_pids=None):
+    processes = find_processes_for_service_record(record, exclude_pids=exclude_pids)
+    descriptions = []
+
+    for proc in processes:
+        try:
+            descriptions.append(f"{proc.pid}:{proc.name()}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            descriptions.append(f"{proc.pid}:<unknown>")
+
+    return processes, descriptions
+
+
+def force_stop_service_processes(record, timeout=30):
+    processes, descriptions = list_service_processes(record, exclude_pids={os.getpid()})
+    if not processes:
+        log_info(f"No residual processes found for service '{record['name']}'")
+        return False
+
+    log_info(
+        f"Force-stopping residual processes for service '{record['name']}': "
+        + ", ".join(descriptions)
+    )
+    terminate_processes(processes, f"service '{record['name']}'", timeout=timeout)
+    return True
+
+
 def get_process_candidate_paths(proc):
     candidate_paths = []
 
@@ -1068,6 +1095,8 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
 
         if service_type == "windows-service":
             current_state = get_windows_service_state(record) or "Unknown"
+            processes, process_descriptions = list_service_processes(record, exclude_pids=exclude_pids)
+            has_processes = bool(processes)
             if current_state != last_logged_state:
                 log_info(f"Windows service '{record['name']}' current state: {current_state}")
                 last_logged_state = current_state
@@ -1075,12 +1104,14 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
             if progress_bucket != last_progress_bucket:
                 log_info(
                     f"Service '{record['name']}' wait progress: elapsed={elapsed_seconds}s, "
-                    f"target={target_state_name}, current_state={current_state}"
+                    f"target={target_state_name}, current_state={current_state}, "
+                    f"processes={','.join(process_descriptions) if process_descriptions else '<none>'}"
                 )
                 last_progress_bucket = progress_bucket
-            if should_be_running and running:
+            state_lower = current_state.lower()
+            if should_be_running and state_lower == "running":
                 return
-            if not should_be_running and not running:
+            if not should_be_running and state_lower == "stopped" and not has_processes:
                 return
             time.sleep(1)
             continue
@@ -1259,6 +1290,24 @@ def ensure_service_stopped(record, timeout=60, max_attempts=3):
             log_info(f"Service '{record['name']}' stopped successfully")
             return
         except Exception as e:
+            if record.get("service_type") == "windows-service":
+                try:
+                    force_stop_service_processes(record, timeout=30)
+                    wait_for_service_transition(
+                        record,
+                        should_be_running=False,
+                        timeout=min(timeout, 15),
+                        exclude_pids={os.getpid()},
+                    )
+                    log_info(
+                        f"Service '{record['name']}' reached a fully stopped state after residual process cleanup"
+                    )
+                    return
+                except Exception as cleanup_error:
+                    log_error(
+                        f"Residual process cleanup failed for service '{record['name']}' on attempt {attempt}: {cleanup_error}"
+                    )
+
             if attempt >= max_attempts:
                 raise RuntimeError(
                     f"Service '{record['name']}' did not stop after {max_attempts} attempts: {e}"
