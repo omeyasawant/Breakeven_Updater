@@ -36,6 +36,7 @@ import hashlib
 import logging
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -685,6 +686,32 @@ def create_windows_helper_launcher(helper_dir, command, helper_env):
     return launcher_path
 
 
+def create_posix_helper_launcher(helper_dir, command, helper_env):
+    launcher_path = os.path.join(helper_dir, "launch_helper.sh")
+    bootstrap_log = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
+    quoted_bootstrap_log = shlex.quote(bootstrap_log)
+    quoted_helper_dir = shlex.quote(helper_dir)
+    quoted_command = " ".join(shlex.quote(str(part)) for part in command)
+    lines = [
+        "#!/bin/bash",
+        "set -e",
+        f"export {RUNTIME_BASE_ENV}={shlex.quote(helper_env[RUNTIME_BASE_ENV])}",
+        f"export {HELPER_STATE_ENV}={shlex.quote(helper_env[HELPER_STATE_ENV])}",
+        f"export {HELPER_BOOTSTRAP_LOG_ENV}={shlex.quote(helper_env[HELPER_BOOTSTRAP_LOG_ENV])}",
+        f'echo "$(date \'+%Y-%m-%d %H:%M:%S\') | Launcher entrypoint reached" >> {quoted_bootstrap_log}',
+        f'echo "$(date \'+%Y-%m-%d %H:%M:%S\') | Launcher working directory {helper_dir}" >> {quoted_bootstrap_log}',
+        f"cd {quoted_helper_dir}",
+        f'echo "$(date \'+%Y-%m-%d %H:%M:%S\') | Launching helper executable {command[0]}" >> {quoted_bootstrap_log}',
+        f"exec {quoted_command}",
+    ]
+
+    with open(launcher_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    os.chmod(launcher_path, 0o755)
+    return launcher_path
+
+
 def launch_helper_via_schtasks(command, helper_dir, helper_env):
     task_name = f"BreakEvenUpdaterHelper_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
     bootstrap_log_path = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
@@ -735,9 +762,41 @@ def launch_helper_via_schtasks(command, helper_dir, helper_env):
     return {"task_name": task_name, "pid": None, "launcher_path": launcher_path}
 
 
+def launch_helper_via_systemd(command, helper_dir, helper_env):
+    unit_name = f"breakeven-updater-helper-{datetime.now().strftime('%Y%m%d_%H%M%S')}-{os.getpid()}"
+    bootstrap_log_path = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
+    launcher_path = create_posix_helper_launcher(helper_dir, command, helper_env)
+
+    run_command = [
+        "systemd-run",
+        "--user",
+        "--unit",
+        unit_name,
+        "/bin/bash",
+        launcher_path,
+    ]
+
+    append_helper_bootstrap_log(
+        bootstrap_log_path,
+        f"Creating systemd helper unit: {unit_name} -> {launcher_path}",
+    )
+    run_command_checked(
+        run_command,
+        timeout=30,
+        context=f"systemd-run {unit_name}",
+        log_path=bootstrap_log_path,
+    )
+
+    append_helper_bootstrap_log(bootstrap_log_path, f"Systemd helper unit created: {unit_name}")
+    return {"task_name": unit_name, "pid": None, "launcher_path": launcher_path}
+
+
 def launch_helper_process(command, helper_dir, helper_env):
     if os.name == "nt":
         return launch_helper_via_schtasks(command, helper_dir, helper_env)
+
+    if sys.platform.startswith("linux"):
+        return launch_helper_via_systemd(command, helper_dir, helper_env)
 
     proc = spawn_detached(command, cwd=helper_dir, env=helper_env)
     return {"task_name": None, "pid": proc.pid}
