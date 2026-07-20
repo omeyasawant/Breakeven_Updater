@@ -599,13 +599,32 @@ def windows_quote_arg(value):
     return subprocess.list2cmdline([str(value)])
 
 
+def powershell_quote_arg(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def create_windows_helper_launcher(helper_dir, command, helper_env):
     launcher_path = os.path.join(helper_dir, "launch_helper.cmd")
     program_path = str(command[0])
     command_args = [str(part) for part in command[1:]]
     quoted_program = windows_quote_arg(program_path)
-    quoted_args = " ".join(windows_quote_arg(arg) for arg in command_args)
     bootstrap_log = helper_env[HELPER_BOOTSTRAP_LOG_ENV]
+    ps_program = powershell_quote_arg(program_path)
+    ps_helper_dir = powershell_quote_arg(helper_dir)
+    ps_bootstrap_log = powershell_quote_arg(bootstrap_log)
+    ps_runtime_base = powershell_quote_arg(helper_env[RUNTIME_BASE_ENV])
+    ps_state_path = powershell_quote_arg(helper_env[HELPER_STATE_ENV])
+    ps_arg_list = "@(" + ", ".join(powershell_quote_arg(arg) for arg in command_args) + ")"
+    powershell_command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$env:{RUNTIME_BASE_ENV} = {ps_runtime_base}; "
+        f"$env:{HELPER_STATE_ENV} = {ps_state_path}; "
+        f"$env:{HELPER_BOOTSTRAP_LOG_ENV} = {ps_bootstrap_log}; "
+        f"$process = Start-Process -FilePath {ps_program} -ArgumentList {ps_arg_list} "
+        f"-WorkingDirectory {ps_helper_dir} -WindowStyle Hidden -PassThru; "
+        f"Add-Content -Path {ps_bootstrap_log} -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' | PowerShell launcher started helper pid=' + $process.Id)"
+    )
+    quoted_ps_command = windows_quote_arg(powershell_command)
     lines = [
         "@echo off",
         "setlocal",
@@ -617,7 +636,7 @@ def create_windows_helper_launcher(helper_dir, command, helper_env):
         f'if not exist {quoted_program} echo %date% %time% ^| Helper executable missing: {program_path}>>"{bootstrap_log}"',
         f'cd /d "{helper_dir}"',
         f'echo %date% %time% ^| Launching helper executable {program_path}>>"{bootstrap_log}"',
-        f'start "" /b {quoted_program} {quoted_args}',
+        f'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command {quoted_ps_command}',
         f'echo %date% %time% ^| START command exit code %ERRORLEVEL%>>"{bootstrap_log}"',
         "exit /b %ERRORLEVEL%",
     ]
@@ -687,11 +706,10 @@ def launch_helper_process(command, helper_dir, helper_env):
 def wait_for_helper_startup(bootstrap_log_path, timeout=20):
     deadline = time.time() + timeout
     success_markers = [
-        "Launcher entrypoint reached",
-        "Launching helper executable",
         "Process entrypoint reached",
         "Entered helper mode",
         "Helper state file loaded successfully",
+        "PowerShell launcher started helper pid=",
     ]
 
     while time.time() < deadline:
