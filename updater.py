@@ -1476,10 +1476,25 @@ def get_service_stop_priority(record):
     return 3
 
 
-def get_current_program_path():
+def resolve_current_program_source_path(runtime_state=None):
+    appimage_path = os.environ.get("APPIMAGE")
+    if appimage_path and os.path.exists(appimage_path):
+        return os.path.abspath(appimage_path)
+
+    if os.name != "nt":
+        for record in (runtime_state or {}).get("service_records", []):
+            if record.get("is_updater") and record.get("binary_path"):
+                binary_path = os.path.abspath(record["binary_path"])
+                if os.path.exists(binary_path):
+                    return binary_path
+
     if getattr(sys, "frozen", False):
         return os.path.abspath(sys.executable)
     return os.path.abspath(__file__)
+
+
+def get_current_program_path():
+    return resolve_current_program_source_path()
 
 
 def current_program_is_managed_install(config):
@@ -1719,7 +1734,7 @@ def get_helper_runtime_root(config):
     return runtime_root
 
 
-def create_helper_copy(config):
+def create_helper_copy(config, runtime_state=None):
     runtime_root = get_helper_runtime_root(config)
     helper_dir = os.path.join(
         runtime_root,
@@ -1727,15 +1742,15 @@ def create_helper_copy(config):
     )
     os.makedirs(helper_dir, exist_ok=True)
 
+    source_path = resolve_current_program_source_path(runtime_state=runtime_state)
+    helper_name = os.path.basename(source_path)
+
     if getattr(sys, "frozen", False):
-        source_path = sys.executable
-        helper_name = os.path.basename(sys.executable)
+        stem, ext = os.path.splitext(helper_name)
         if os.name == "nt":
-            stem, ext = os.path.splitext(helper_name)
             helper_name = f"{stem}_Helper{ext}"
-    else:
-        source_path = os.path.abspath(__file__)
-        helper_name = os.path.basename(__file__)
+        elif helper_name.endswith(".AppImage"):
+            helper_name = f"{stem}_Helper{ext}"
 
     helper_path = os.path.join(helper_dir, helper_name)
     shutil.copy2(source_path, helper_path)
@@ -1833,7 +1848,7 @@ def delete_windows_task(task_name):
 
 
 def launch_update_helper(manifest, local_version, latest_version, os_type, config, runtime_state):
-    helper_dir, helper_path = create_helper_copy(config)
+    helper_dir, helper_path = create_helper_copy(config, runtime_state=runtime_state)
     runtime_root = get_helper_runtime_root(config)
     state_path = os.path.join(helper_dir, "update_state.json")
     bootstrap_log_path = os.path.join(helper_dir, "helper_bootstrap.log")
