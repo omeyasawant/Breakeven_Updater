@@ -72,6 +72,11 @@ SERVICE_MANIFEST_FILES = (
     "tray_service_manifest.json",
     "updater_service_manifest.json",
 )
+DASHBOARD_PROC_TOKENS = [
+    "breakeven dashboard",
+    "breakevendashboard",
+    "breakevendashboard.exe",
+]
 WINDOWS_DETACHED_FLAGS = (
     getattr(subprocess, "DETACHED_PROCESS", 0)
     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -497,6 +502,41 @@ def parse_helper_state_path(argv=None):
 
 def normalize_fs_path(path_value):
     return os.path.normcase(os.path.abspath(path_value))
+
+
+def compact_process_text(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def dashboard_image_names(launch_target):
+    names = []
+    if launch_target:
+        base_name = os.path.basename(launch_target)
+        stem, ext = os.path.splitext(base_name)
+        names.extend([base_name, stem])
+        compact_stem = compact_process_text(stem)
+        if compact_stem:
+            names.append(compact_stem)
+            if ext:
+                names.append(f"{compact_stem}{ext.lower()}")
+
+    names.extend([
+        "BreakEven Dashboard.exe",
+        "BreakEven Dashboard",
+        "BreakEven.exe",
+        "BreakEven",
+        "breakevendashboard.exe",
+        "breakevendashboard",
+    ])
+
+    deduped = []
+    seen = set()
+    for name in names:
+        key = (name or "").lower()
+        if name and key not in seen:
+            seen.add(key)
+            deduped.append(name)
+    return deduped
 
 
 def is_path_within_root(path_value, root_path):
@@ -979,6 +1019,273 @@ def find_processes_for_service_record(record, exclude_pids=None):
     return find_processes_by_targets(target_paths=target_paths, exclude_pids=exclude_pids)
 
 
+def resolve_dashboard_candidate(install_path):
+    dashboard_dir = os.path.join(install_path, "dashboard_gui")
+    os_type = get_os_type()
+    candidates = []
+    if os_type == "windows":
+        candidates = [
+            os.path.join(dashboard_dir, "BreakEven Dashboard.exe"),
+            os.path.join(dashboard_dir, "BreakEven.exe"),
+        ]
+    elif os_type == "linux":
+        candidates = [
+            os.path.join(dashboard_dir, "BreakEven.AppImage"),
+            os.path.join(dashboard_dir, "BreakEven.deb"),
+            os.path.join(dashboard_dir, "BreakEven.rpm"),
+        ]
+    elif os_type == "macos":
+        candidates = [
+            os.path.join(dashboard_dir, "BreakEven.app"),
+            os.path.join(dashboard_dir, "BreakEven.dmg"),
+        ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    if os_type == "linux":
+        return resolve_linux_dashboard_launch_command(dashboard_dir)
+
+    return None
+
+
+def resolve_linux_dashboard_launch_command(dashboard_dir):
+    command_candidates = [
+        shutil.which("breakevendashboard"),
+        shutil.which("breakeven"),
+        os.path.join(dashboard_dir, "BreakEven"),
+        "/usr/bin/breakevendashboard",
+        "/usr/bin/breakeven",
+        "/usr/local/bin/breakevendashboard",
+        "/usr/local/bin/breakeven",
+        "/opt/BreakEven/breakeven",
+    ]
+    for candidate in command_candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def process_matches_exact_path(proc, target_path):
+    if not target_path:
+        return False
+
+    try:
+        exe_path = proc.info.get("exe") or proc.exe()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    except Exception:
+        return False
+
+    if not exe_path:
+        return False
+
+    try:
+        return normalize_fs_path(exe_path) == normalize_fs_path(target_path)
+    except Exception:
+        return False
+
+
+def is_dashboard_process(proc, launch_target):
+    try:
+        info = getattr(proc, "info", {}) or {}
+        name = str(info.get("name") or "").lower()
+        raw_cmdline = info.get("cmdline") or []
+        cmdline = " ".join(str(part) for part in raw_cmdline).lower()
+        cmdline_parts = [str(part) for part in raw_cmdline]
+
+        compact_name = compact_process_text(name)
+        compact_cmdline = compact_process_text(cmdline)
+        compact_cmdline_parts = {
+            compact_process_text(part)
+            for part in cmdline_parts
+            if part
+        }
+        compact_cmdline_basenames = {
+            compact_process_text(os.path.basename(part))
+            for part in cmdline_parts
+            if part
+        }
+
+        excluded_tokens = [
+            "breakevenslave",
+            "slaveservicehost",
+            "breakevenupdater",
+            "breakeventray",
+            "taskkillexe",
+            "powershellexe",
+            "cmdexe",
+        ]
+        if any(token in compact_name for token in excluded_tokens):
+            return False
+        if any(token in compact_cmdline for token in excluded_tokens):
+            return False
+
+        if launch_target and process_matches_exact_path(proc, launch_target):
+            return True
+
+        target_tokens = {
+            compact_process_text(token)
+            for token in DASHBOARD_PROC_TOKENS
+            if token
+        }
+        if launch_target:
+            target_name = os.path.basename(launch_target).lower()
+            launch_target_compact = compact_process_text(target_name)
+            launch_target_stem_compact = compact_process_text(os.path.splitext(target_name)[0])
+            if launch_target_compact:
+                target_tokens.add(launch_target_compact)
+            if launch_target_stem_compact:
+                target_tokens.add(launch_target_stem_compact)
+
+        target_tokens = {token for token in target_tokens if token}
+
+        if compact_name in target_tokens:
+            return True
+        if target_tokens & compact_cmdline_parts:
+            return True
+        if target_tokens & compact_cmdline_basenames:
+            return True
+
+        if "breakevendashboard" in compact_cmdline:
+            return True
+        if "dashboardgui" in compact_cmdline and "breakeven" in compact_cmdline:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+def find_dashboard_processes(launch_target=None, exclude_pids=None):
+    exclude_pids = set(exclude_pids or [])
+    matches = []
+    seen_pids = set()
+
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        if proc.pid in exclude_pids:
+            continue
+        if not is_dashboard_process(proc, launch_target):
+            continue
+        if proc.pid in seen_pids:
+            continue
+        seen_pids.add(proc.pid)
+        matches.append(proc)
+
+    return matches
+
+
+def close_dashboard_processes(processes, launch_target, timeout=30):
+    terminated = False
+    os_type = get_os_type()
+
+    if os_type != "windows":
+        if processes:
+            terminate_processes(processes, "dashboard", timeout=timeout)
+            return True
+        return False
+
+    try:
+        direct_kill = subprocess.run(
+            ["taskkill", "/IM", "breakevendashboard.exe", "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            **build_subprocess_kwargs(),
+        )
+        log_info(
+            "Direct dashboard image kill result: "
+            f"code={direct_kill.returncode} stdout={(direct_kill.stdout or '').strip()} "
+            f"stderr={(direct_kill.stderr or '').strip()}"
+        )
+        if direct_kill.returncode == 0:
+            terminated = True
+    except Exception as exc:
+        log_error(f"Direct dashboard image kill failed: {exc}")
+
+    if processes:
+        log_info(
+            "Closing dashboard processes: "
+            + ", ".join(f"{proc.pid}:{proc.info.get('name') or 'unknown'}" for proc in processes)
+        )
+
+    for proc in processes:
+        proc_name = "unknown"
+        try:
+            proc_name = proc.name()
+        except Exception:
+            pass
+
+        try:
+            log_info(f"Attempting taskkill for dashboard pid={proc.pid} name={proc_name}")
+            kill_proc = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                shell=False,
+                **build_subprocess_kwargs(),
+            )
+            if kill_proc.returncode == 0:
+                log_info(f"taskkill succeeded for dashboard pid={proc.pid} name={proc_name}")
+                terminated = True
+                continue
+            log_info(
+                f"taskkill returned code={kill_proc.returncode} for dashboard pid={proc.pid}: "
+                f"stdout={(kill_proc.stdout or '').strip()} stderr={(kill_proc.stderr or '').strip()}"
+            )
+        except Exception as exc:
+            log_error(f"taskkill failed for dashboard pid={proc.pid}: {exc}")
+
+        try:
+            terminate_processes([proc], "dashboard", timeout=min(timeout, 10))
+            terminated = True
+        except Exception as exc:
+            log_error(f"Fallback process termination failed for dashboard pid={proc.pid}: {exc}")
+
+    for image_name in dashboard_image_names(launch_target):
+        try:
+            image_kill = subprocess.run(
+                ["taskkill", "/IM", image_name, "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                shell=False,
+                **build_subprocess_kwargs(),
+            )
+            if image_kill.returncode == 0:
+                log_info(f"taskkill succeeded for dashboard image: {image_name}")
+                terminated = True
+        except Exception:
+            pass
+
+    try:
+        ps_kill = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "$killed = @(Get-Process | Where-Object { $_.ProcessName -match 'breakeven.*dashboard|dashboard.*breakeven' }); "
+                "if ($killed.Count -gt 0) { $killed | Stop-Process -Force; Write-Output ($killed | ForEach-Object { $_.ProcessName } | Sort-Object -Unique | Join-String -Separator ',') }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            **build_subprocess_kwargs(),
+        )
+        if ps_kill.returncode == 0 and (ps_kill.stdout or "").strip():
+            log_info(f"PowerShell dashboard kill matched: {(ps_kill.stdout or '').strip()}")
+            terminated = True
+    except Exception as exc:
+        log_error(f"PowerShell dashboard kill failed: {exc}")
+
+    return terminated
+
+
 def terminate_processes(processes, label, timeout=30):
     active_processes = []
     for proc in processes:
@@ -1191,13 +1498,16 @@ def inspect_runtime_state(config):
         state_label = "running" if record["was_running"] else "stopped"
         log_info(f"Service '{record['name']}' detected as {state_label}")
 
-    dashboard_processes = find_processes_by_targets(
-        target_roots=[os.path.join(config["installPath"], "dashboard_gui")],
+    dashboard_launch_target = resolve_dashboard_candidate(config["installPath"])
+    dashboard_processes = find_dashboard_processes(
+        launch_target=dashboard_launch_target,
         exclude_pids={os.getpid()},
     )
     dashboard_records = []
     if dashboard_processes:
-        process_ids = ", ".join(str(proc.pid) for proc in dashboard_processes)
+        process_ids = ", ".join(
+            f"{proc.pid}:{proc.info.get('name') or 'unknown'}" for proc in dashboard_processes
+        )
         log_info(f"Dashboard currently running with processes: {process_ids}")
         for proc in dashboard_processes:
             try:
@@ -1242,8 +1552,9 @@ def find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids=None
 
 def collect_dashboard_processes(config, runtime_state=None):
     dashboard_dir = os.path.join(config["installPath"], "dashboard_gui")
-    processes = find_processes_by_targets(
-        target_roots=[dashboard_dir],
+    dashboard_launch_target = resolve_dashboard_candidate(config["installPath"])
+    processes = find_dashboard_processes(
+        launch_target=dashboard_launch_target,
         exclude_pids={os.getpid()},
     )
 
@@ -1251,11 +1562,11 @@ def collect_dashboard_processes(config, runtime_state=None):
         log_info("Dashboard was marked running before helper handoff; retrying by preserved process names")
         processes = find_dashboard_processes_from_runtime_state(runtime_state, exclude_pids={os.getpid()})
 
-    return dashboard_dir, processes
+    return dashboard_dir, dashboard_launch_target, processes
 
 
 def stop_dashboard_if_running(config, runtime_state=None):
-    dashboard_dir, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
+    dashboard_dir, dashboard_launch_target, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
     log_info(f"Checking dashboard processes under: {dashboard_dir}")
 
     if not processes:
@@ -1265,12 +1576,12 @@ def stop_dashboard_if_running(config, runtime_state=None):
     dashboard_process_ids = ", ".join(str(proc.pid) for proc in processes)
     log_info(f"Dashboard candidate processes selected for stop: {dashboard_process_ids}")
     log_info("Dashboard is running; closing it before update")
-    terminate_processes(processes, "dashboard", timeout=30)
+    close_dashboard_processes(processes, dashboard_launch_target, timeout=30)
     return True
 
 
 def ensure_dashboard_stopped(config, runtime_state=None, max_attempts=3):
-    dashboard_dir, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
+    dashboard_dir, dashboard_launch_target, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
     was_running = bool(processes)
 
     if not was_running:
@@ -1282,9 +1593,10 @@ def ensure_dashboard_stopped(config, runtime_state=None, max_attempts=3):
         log_info(
             f"Dashboard stop attempt {attempt}/{max_attempts} with candidate processes: {process_ids}"
         )
-        terminate_processes(processes, "dashboard", timeout=30)
+        close_dashboard_processes(processes, dashboard_launch_target, timeout=30)
+        time.sleep(1.0)
 
-        _, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
+        _, dashboard_launch_target, processes = collect_dashboard_processes(config, runtime_state=runtime_state)
         if not processes:
             log_info("Dashboard confirmed stopped")
             return True
@@ -1337,63 +1649,58 @@ def ensure_service_stopped(record, timeout=60, max_attempts=3):
 
 def launch_dashboard_if_present(install_path):
     dashboard_dir = os.path.join(install_path, "dashboard_gui")
-    if not os.path.isdir(dashboard_dir):
-        log_info(f"Dashboard directory not found, skipping relaunch: {dashboard_dir}")
-        return False
+    launch_target = resolve_dashboard_candidate(install_path)
 
     try:
         if sys.platform.startswith("win"):
-            for candidate_name in ["BreakEven.exe", "BreakEven Dashboard.exe"]:
-                candidate_path = os.path.join(dashboard_dir, candidate_name)
-                if os.path.exists(candidate_path):
-                    spawn_detached([candidate_path], cwd=dashboard_dir)
-                    log_info(f"Dashboard relaunched from {candidate_path}")
-                    return True
+            if launch_target and os.path.exists(launch_target):
+                spawn_detached([launch_target], cwd=os.path.dirname(launch_target) or dashboard_dir)
+                log_info(f"Dashboard relaunched from {launch_target}")
+                return True
 
             log_info(f"No Windows dashboard executable found in {dashboard_dir}")
             return False
 
         if sys.platform == "darwin":
-            app_path = os.path.join(dashboard_dir, "BreakEven.app")
-            if os.path.exists(app_path):
-                spawn_detached(["open", app_path], cwd=dashboard_dir)
-                log_info(f"Dashboard relaunched from {app_path}")
+            if launch_target and os.path.exists(launch_target) and launch_target.endswith(".app"):
+                spawn_detached(["open", launch_target], cwd=dashboard_dir)
+                log_info(f"Dashboard relaunched from {launch_target}")
                 return True
 
-            dmg_path = os.path.join(dashboard_dir, "BreakEven.dmg")
-            if os.path.exists(dmg_path):
-                spawn_detached(["open", dmg_path], cwd=dashboard_dir)
-                log_info(f"Dashboard disk image reopened from {dmg_path}")
+            if launch_target and os.path.exists(launch_target) and launch_target.endswith(".dmg"):
+                spawn_detached(["open", launch_target], cwd=dashboard_dir)
+                log_info(f"Dashboard disk image reopened from {launch_target}")
                 return True
 
             log_info(f"No macOS dashboard artifact found in {dashboard_dir}")
             return False
 
         if sys.platform.startswith("linux"):
-            executable_candidates = [
-                os.path.join(dashboard_dir, "BreakEven"),
-                os.path.join(dashboard_dir, "BreakEven.AppImage"),
-                os.path.join(dashboard_dir, "BreakEven-x86_64.AppImage"),
-            ]
-            for candidate_path in executable_candidates:
-                if not os.path.exists(candidate_path):
-                    continue
-
+            if launch_target and os.path.exists(launch_target) and not launch_target.endswith((".deb", ".rpm")):
                 try:
-                    os.chmod(candidate_path, 0o755)
+                    os.chmod(launch_target, 0o755)
                 except Exception:
                     pass
 
-                spawn_detached([candidate_path], cwd=dashboard_dir)
-                log_info(f"Dashboard relaunched from {candidate_path}")
+                spawn_detached([launch_target], cwd=os.path.dirname(launch_target) or dashboard_dir)
+                log_info(f"Dashboard relaunched from {launch_target}")
                 return True
 
-            for package_name in ["BreakEven.deb", "BreakEven.rpm"]:
-                package_path = os.path.join(dashboard_dir, package_name)
-                if os.path.exists(package_path):
-                    spawn_detached(["xdg-open", package_path], cwd=dashboard_dir)
-                    log_info(f"Dashboard package reopened from {package_path}")
+            if launch_target and os.path.exists(launch_target) and launch_target.endswith((".deb", ".rpm")):
+                installed_launch = resolve_linux_dashboard_launch_command(dashboard_dir)
+                if installed_launch and os.path.exists(installed_launch):
+                    try:
+                        os.chmod(installed_launch, 0o755)
+                    except Exception:
+                        pass
+
+                    spawn_detached([installed_launch], cwd=os.path.dirname(installed_launch) or dashboard_dir)
+                    log_info(f"Dashboard relaunched from installed binary {installed_launch}")
                     return True
+
+                spawn_detached(["xdg-open", launch_target], cwd=dashboard_dir)
+                log_info(f"Dashboard package reopened from {launch_target}")
+                return True
 
             log_info(f"No Linux dashboard artifact found in {dashboard_dir}")
             return False
