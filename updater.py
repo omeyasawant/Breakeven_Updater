@@ -1423,6 +1423,9 @@ def create_helper_copy(config):
     if getattr(sys, "frozen", False):
         source_path = sys.executable
         helper_name = os.path.basename(sys.executable)
+        if os.name == "nt":
+            stem, ext = os.path.splitext(helper_name)
+            helper_name = f"{stem}_Helper{ext}"
     else:
         source_path = os.path.abspath(__file__)
         helper_name = os.path.basename(__file__)
