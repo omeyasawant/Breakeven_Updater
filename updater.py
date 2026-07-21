@@ -1996,7 +1996,10 @@ def get_helper_runtime_root(config):
 
 
 def get_dashboard_relaunch_request_path(config):
-    return os.path.join(get_helper_runtime_root(config), "dashboard_relaunch_request.json")
+    request_root = config.get("installPath") or config.get("serviceInstallPath") or RUNTIME_BASE_DIR
+    runtime_root = os.path.join(request_root, "updater_runtime")
+    os.makedirs(runtime_root, exist_ok=True)
+    return os.path.join(runtime_root, "dashboard_relaunch_request.json")
 
 
 def queue_dashboard_relaunch_request(config):
