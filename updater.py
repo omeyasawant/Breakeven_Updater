@@ -63,6 +63,7 @@ DOWNLOAD_BASE_DEFAULT = "https://data.breakeventx.com:64444/content-cache/update
 MANIFEST_URL_DEFAULT = f"{DOWNLOAD_BASE_DEFAULT}/{MANIFEST_NAME}"
 
 CHECK_INTERVAL = 3600
+UPDATE_START_DELAY_SECONDS = 120
 
 HELPER_STATE_ARG = "--apply-update-state"
 RUNTIME_BASE_ENV = "BREAKEVEN_UPDATER_RUNTIME_BASE"
@@ -1126,6 +1127,146 @@ def resolve_linux_dashboard_launch_command(dashboard_dir):
     return None
 
 
+def resolve_linux_dashboard_download_target(install_path):
+    dashboard_dir = os.path.join(install_path, "dashboard_gui")
+    local_candidates = [
+        os.path.join(dashboard_dir, "BreakEven.AppImage"),
+        os.path.join(dashboard_dir, "BreakEven-x86_64.AppImage"),
+        os.path.join(dashboard_dir, "BreakEven.deb"),
+        os.path.join(dashboard_dir, "BreakEven.rpm"),
+    ]
+
+    for candidate in local_candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    if shutil.which("apt") or shutil.which("apt-get") or shutil.which("dpkg"):
+        return os.path.join(dashboard_dir, "BreakEven.deb")
+
+    if shutil.which("dnf") or shutil.which("yum") or shutil.which("rpm"):
+        return os.path.join(dashboard_dir, "BreakEven.rpm")
+
+    return None
+
+
+def should_download_component_file(os_type, component_name, file_info, install_path, selected_linux_dashboard_target=None):
+    if os_type != "linux" or component_name != "dashboard_gui":
+        return True
+
+    if not selected_linux_dashboard_target:
+        return True
+
+    selected_name = os.path.basename(selected_linux_dashboard_target)
+    rel_name = os.path.basename(file_info["relative_path"].replace("\\", "/"))
+    should_download = rel_name == selected_name
+
+    if not should_download:
+        log_info(
+            f"Skipping Linux dashboard artifact {rel_name}; selected target is {selected_name}"
+        )
+
+    return should_download
+
+
+def run_linux_dashboard_install_command(base_command, context):
+    commands_to_try = []
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        commands_to_try.append(base_command)
+
+    pkexec_path = shutil.which("pkexec")
+    if pkexec_path and os.environ.get("DISPLAY"):
+        commands_to_try.append([pkexec_path] + base_command)
+
+    sudo_path = shutil.which("sudo")
+    if sudo_path:
+        commands_to_try.append([sudo_path, "-n"] + base_command)
+
+    seen = set()
+    last_error = None
+
+    for command in commands_to_try:
+        command_key = tuple(command)
+        if command_key in seen:
+            continue
+        seen.add(command_key)
+
+        log_info(f"Running Linux dashboard reinstall command for {context}: {format_command(command)}")
+        try:
+            result = run_command_capture(command, timeout=600)
+        except Exception as exc:
+            last_error = str(exc)
+            log_error(f"Linux dashboard reinstall command failed for {context}: {exc}")
+            continue
+
+        stdout = truncate_for_log(result.stdout, limit=2000)
+        stderr = truncate_for_log(result.stderr, limit=2000)
+        if stdout:
+            log_info(f"Linux dashboard reinstall stdout for {context}: {stdout}")
+        if stderr:
+            if result.returncode == 0:
+                log_info(f"Linux dashboard reinstall stderr for {context}: {stderr}")
+            else:
+                log_error(f"Linux dashboard reinstall stderr for {context}: {stderr}")
+
+        if result.returncode == 0:
+            return True
+
+        last_error = f"exit code {result.returncode}"
+
+    raise RuntimeError(
+        f"Unable to reinstall Linux dashboard package for {context}: {last_error or 'no usable privilege escalation path found'}"
+    )
+
+
+def reinstall_linux_dashboard_if_needed(selected_linux_dashboard_target, downloaded_dashboard_files):
+    if not selected_linux_dashboard_target:
+        return
+
+    if selected_linux_dashboard_target not in downloaded_dashboard_files:
+        return
+
+    if selected_linux_dashboard_target.endswith((".AppImage", "-x86_64.AppImage")):
+        log_info(f"Linux dashboard target {selected_linux_dashboard_target} is AppImage; no package reinstall required")
+        return
+
+    if selected_linux_dashboard_target.endswith(".deb"):
+        apt_path = shutil.which("apt") or shutil.which("apt-get")
+        if not apt_path:
+            raise RuntimeError("No apt/apt-get executable found for Linux dashboard .deb reinstall")
+        run_linux_dashboard_install_command(
+            [apt_path, "install", "-y", selected_linux_dashboard_target],
+            os.path.basename(selected_linux_dashboard_target),
+        )
+        return
+
+    if selected_linux_dashboard_target.endswith(".rpm"):
+        dnf_path = shutil.which("dnf")
+        if dnf_path:
+            run_linux_dashboard_install_command(
+                [dnf_path, "install", "-y", selected_linux_dashboard_target],
+                os.path.basename(selected_linux_dashboard_target),
+            )
+            return
+
+        yum_path = shutil.which("yum")
+        if yum_path:
+            run_linux_dashboard_install_command(
+                [yum_path, "localinstall", "-y", selected_linux_dashboard_target],
+                os.path.basename(selected_linux_dashboard_target),
+            )
+            return
+
+        rpm_path = shutil.which("rpm")
+        if rpm_path:
+            run_linux_dashboard_install_command(
+                [rpm_path, "-Uvh", "--replacepkgs", selected_linux_dashboard_target],
+                os.path.basename(selected_linux_dashboard_target),
+            )
+            return
+
+        raise RuntimeError("No rpm-compatible installer found for Linux dashboard .rpm reinstall")
+
+
 def process_matches_exact_path(proc, target_path):
     if not target_path:
         return False
@@ -1987,6 +2128,7 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
 
     services_to_restart = []
     dashboard_was_running = False
+    update_completed = False
 
     try:
         if running_services:
@@ -2015,7 +2157,9 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
             wait_for_pid_exit(helper_state["original_pid"], timeout=60)
 
         log_info("Beginning install/update phase after service and dashboard shutdown")
-        return install_update(os_type, manifest)
+        downloaded_files = install_update(os_type, manifest)
+        update_completed = True
+        return downloaded_files
 
     finally:
         for record in reversed(services_to_restart):
@@ -2026,8 +2170,10 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
             except Exception as restart_error:
                 log_error(f"Failed to restart service '{record['name']}': {restart_error}")
 
-        if dashboard_was_running:
+        if dashboard_was_running and update_completed:
             launch_dashboard_if_present(config["installPath"])
+        elif dashboard_was_running and not update_completed:
+            log_info("Skipping dashboard relaunch because update did not complete successfully")
 
 
 def run_helper_update_job(state_path):
@@ -2075,11 +2221,27 @@ def install_update(os_type, manifest):
     log_info(f"Installing update for OS={os_type}, version_path={version_path}")
 
     downloaded_files = []
+    downloaded_dashboard_files = []
+    selected_linux_dashboard_target = None
+
+    if os_type == "linux" and "dashboard_gui" in components:
+        selected_linux_dashboard_target = resolve_linux_dashboard_download_target(install_path)
+        if selected_linux_dashboard_target:
+            log_info(f"Selected Linux dashboard artifact target: {selected_linux_dashboard_target}")
 
     for component_name, component_data in components.items():
         log_info(f"Processing component: {component_name}")
 
         for file_info in component_data.get("files", []):
+            if not should_download_component_file(
+                os_type,
+                component_name,
+                file_info,
+                install_path,
+                selected_linux_dashboard_target=selected_linux_dashboard_target,
+            ):
+                continue
+
             rel_path = file_info["relative_path"]
             expected_sha256 = file_info["sha256"]
 
@@ -2088,8 +2250,13 @@ def install_update(os_type, manifest):
 
             download_file_verified(url, dest, expected_sha256)
             downloaded_files.append(dest)
+            if component_name == "dashboard_gui":
+                downloaded_dashboard_files.append(dest)
 
     latest_version = manifest.get("stable_version") or stable_info.get("version")
+
+    if os_type == "linux":
+        reinstall_linux_dashboard_if_needed(selected_linux_dashboard_target, downloaded_dashboard_files)
 
     config_paths_to_update = [os.path.join(install_path, "client_config.json")]
 
@@ -2183,6 +2350,12 @@ def run_update_cycle(manifest=None, helper_mode=False, helper_state=None):
         log_info(f"Local Version: {local_version}")
         log_info(f"OS Type: {os_type}")
         log_info(f"Latest Version: {latest_version}")
+
+        if not helper_mode:
+            log_info(
+                f"Waiting {UPDATE_START_DELAY_SECONDS} seconds before starting update coordination"
+            )
+            time.sleep(UPDATE_START_DELAY_SECONDS)
 
         runtime_state = helper_state.get("runtime_state") if helper_mode and helper_state else None
         if runtime_state:
