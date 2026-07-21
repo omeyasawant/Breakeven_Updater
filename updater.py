@@ -473,6 +473,12 @@ def download_file_verified(url, dest_path, expected_sha256):
 
         os.replace(temp_path, dest_path)
 
+        if os.name != "nt" and dest_path.endswith(".AppImage"):
+            try:
+                os.chmod(dest_path, 0o755)
+            except Exception as e:
+                log_error(f"Failed setting executable bit on {dest_path}: {e}")
+
     except Exception:
         if os.path.exists(temp_path):
             try:
@@ -1234,7 +1240,7 @@ def reinstall_linux_dashboard_if_needed(selected_linux_dashboard_target, downloa
         if not apt_path:
             raise RuntimeError("No apt/apt-get executable found for Linux dashboard .deb reinstall")
         run_linux_dashboard_install_command(
-            [apt_path, "install", "-y", selected_linux_dashboard_target],
+            [apt_path, "install", "--reinstall", "-y", selected_linux_dashboard_target],
             os.path.basename(selected_linux_dashboard_target),
         )
         return
@@ -1660,6 +1666,60 @@ def wait_for_service_transition(record, should_be_running, timeout=45, exclude_p
     raise RuntimeError(f"Timed out waiting for service {record['name']} to become {state_name}")
 
 
+def get_file_mtime(path_value):
+    if not path_value or not os.path.exists(path_value):
+        return None
+
+    try:
+        return os.path.getmtime(path_value)
+    except Exception:
+        return None
+
+
+def ensure_service_healthy_after_start(record, baseline_log_mtime=None, timeout=20, stability_seconds=5):
+    if record.get("service_type") != "systemd-user-service":
+        return
+
+    log_path = record.get("log_file")
+    saw_log_activity = log_path is None
+    healthy_since = None
+    deadline = time.time() + timeout
+
+    log_info(
+        f"Verifying service '{record['name']}' remains healthy after restart "
+        f"(timeout={timeout}s, stability={stability_seconds}s)"
+    )
+
+    while time.time() < deadline:
+        running = is_service_running(record)
+        processes = find_processes_for_service_record(record, exclude_pids={os.getpid()})
+        if not running and not processes:
+            raise RuntimeError(f"Service '{record['name']}' exited shortly after restart")
+
+        if log_path and not saw_log_activity:
+            current_log_mtime = get_file_mtime(log_path)
+            if current_log_mtime is not None and (
+                baseline_log_mtime is None or current_log_mtime > baseline_log_mtime
+            ):
+                saw_log_activity = True
+                log_info(f"Service '{record['name']}' log activity detected at {log_path}")
+
+        if running and processes and saw_log_activity:
+            if healthy_since is None:
+                healthy_since = time.time()
+            elif (time.time() - healthy_since) >= stability_seconds:
+                return
+        else:
+            healthy_since = None
+
+        time.sleep(1)
+
+    if log_path and not saw_log_activity:
+        raise RuntimeError(f"Service '{record['name']}' did not update log file after restart: {log_path}")
+
+    raise RuntimeError(f"Service '{record['name']}' did not remain healthy after restart")
+
+
 def get_service_stop_priority(record):
     name_parts = " ".join(
         str(part).lower()
@@ -1862,15 +1922,16 @@ def ensure_service_stopped(record, timeout=60, max_attempts=3):
             invoke_service_action(record, "stop", timeout=45)
 
 
-def launch_dashboard_if_present(install_path):
+def launch_dashboard_if_present(config):
+    install_path = config["installPath"]
     dashboard_dir = os.path.join(install_path, "dashboard_gui")
     launch_target = resolve_dashboard_candidate(install_path)
 
     try:
         if sys.platform.startswith("win"):
             if launch_target and os.path.exists(launch_target):
-                spawn_detached([launch_target], cwd=os.path.dirname(launch_target) or dashboard_dir)
-                log_info(f"Dashboard relaunched from {launch_target}")
+                queue_dashboard_relaunch_request(config)
+                log_info("Dashboard relaunch delegated to tray session on Windows")
                 return True
 
             log_info(f"No Windows dashboard executable found in {dashboard_dir}")
@@ -1897,8 +1958,8 @@ def launch_dashboard_if_present(install_path):
                 except Exception:
                     pass
 
-                spawn_detached([launch_target], cwd=os.path.dirname(launch_target) or dashboard_dir)
-                log_info(f"Dashboard relaunched from {launch_target}")
+                queue_dashboard_relaunch_request(config)
+                log_info("Dashboard relaunch delegated to tray session on Linux")
                 return True
 
             if launch_target and os.path.exists(launch_target) and launch_target.endswith((".deb", ".rpm")):
@@ -1909,12 +1970,12 @@ def launch_dashboard_if_present(install_path):
                     except Exception:
                         pass
 
-                    spawn_detached([installed_launch], cwd=os.path.dirname(installed_launch) or dashboard_dir)
-                    log_info(f"Dashboard relaunched from installed binary {installed_launch}")
+                    queue_dashboard_relaunch_request(config)
+                    log_info("Dashboard relaunch delegated to tray session on Linux")
                     return True
 
-                spawn_detached(["xdg-open", launch_target], cwd=dashboard_dir)
-                log_info(f"Dashboard package reopened from {launch_target}")
+                queue_dashboard_relaunch_request(config)
+                log_info("Dashboard relaunch request queued; tray will resolve the Linux dashboard launch target")
                 return True
 
             log_info(f"No Linux dashboard artifact found in {dashboard_dir}")
@@ -1932,6 +1993,26 @@ def get_helper_runtime_root(config):
     runtime_root = os.path.join(base_root, "updater_runtime")
     os.makedirs(runtime_root, exist_ok=True)
     return runtime_root
+
+
+def get_dashboard_relaunch_request_path(config):
+    return os.path.join(get_helper_runtime_root(config), "dashboard_relaunch_request.json")
+
+
+def queue_dashboard_relaunch_request(config):
+    request_path = get_dashboard_relaunch_request_path(config)
+    request_payload = {
+        "requested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "install_path": config.get("installPath") or "",
+        "platform": sys.platform,
+    }
+
+    os.makedirs(os.path.dirname(request_path), exist_ok=True)
+    with open(request_path, "w", encoding="utf-8") as f:
+        json.dump(request_payload, f)
+
+    log_info(f"Queued dashboard relaunch request for tray session at {request_path}")
+    return request_path
 
 
 def create_helper_copy(config, runtime_state=None):
@@ -2164,14 +2245,16 @@ def perform_coordinated_update(os_type, manifest, config, helper_state=None, run
     finally:
         for record in reversed(services_to_restart):
             try:
+                baseline_log_mtime = get_file_mtime(record.get("log_file"))
                 invoke_service_action(record, "start", timeout=45)
                 wait_for_service_transition(record, should_be_running=True, timeout=60, exclude_pids={os.getpid()})
+                ensure_service_healthy_after_start(record, baseline_log_mtime=baseline_log_mtime)
                 log_info(f"Service '{record['name']}' restarted successfully")
             except Exception as restart_error:
                 log_error(f"Failed to restart service '{record['name']}': {restart_error}")
 
         if dashboard_was_running and update_completed:
-            launch_dashboard_if_present(config["installPath"])
+            launch_dashboard_if_present(config)
         elif dashboard_was_running and not update_completed:
             log_info("Skipping dashboard relaunch because update did not complete successfully")
 
@@ -2289,6 +2372,12 @@ def install_update(os_type, manifest):
                 os.remove(dst_file)
     
             os.replace(temp_dst, dst_file)
+
+            if os_type == "linux" and dst_file.endswith(".AppImage"):
+                try:
+                    os.chmod(dst_file, 0o755)
+                except Exception as e:
+                    log_error(f"Failed setting executable bit on synced service file {dst_file}: {e}")
     
             log_info(f"Replaced service file -> {dst_file}")
 
