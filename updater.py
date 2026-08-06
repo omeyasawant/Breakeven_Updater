@@ -246,7 +246,7 @@ def get_config():
 # In[ ]:
 
 
-def update_config_version_at_path(config_path, new_version):
+def update_config_version_at_path(config_path, new_version, config=None):
     if not config_path:
         return
 
@@ -259,8 +259,33 @@ def update_config_version_at_path(config_path, new_version):
 
     config["version"] = new_version
 
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except OSError as exc:
+        if not should_prefer_privilege_fallback(config) or not should_attempt_privilege_fallback(exc):
+            raise
+
+        temp_config_path = os.path.join(
+            tempfile.gettempdir(),
+            f"breakeven-updater-config-{os.getpid()}-{int(time.time() * 1000)}.json",
+        )
+        try:
+            with open(temp_config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+
+            copy_path_with_privilege_fallback(
+                temp_config_path,
+                config_path,
+                config,
+                f"update config version {config_path}",
+            )
+        finally:
+            try:
+                if os.path.exists(temp_config_path):
+                    os.remove(temp_config_path)
+            except Exception:
+                pass
 
     log_info(f"Updated version to {new_version} in {config_path}")
 
@@ -451,13 +476,23 @@ def verify_checksum(file_path, expected_sha256):
     log_info(f"Checksum OK for {file_path}")
 
 
-def download_file_verified(url, dest_path, expected_sha256):
+def download_file_verified(url, dest_path, expected_sha256, config=None):
     log_info(f"Downloading: {url} -> {dest_path}")
 
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    target_dir = os.path.dirname(dest_path)
     temp_path = dest_path + ".download"
 
     try:
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            if not should_prefer_privilege_fallback(config) or not should_attempt_privilege_fallback(exc):
+                raise
+            temp_path = os.path.join(
+                tempfile.gettempdir(),
+                f"breakeven-update-{uuid.uuid4().hex}.download",
+            )
+
         with requests.get(url, stream=True, timeout=60) as res:
             res.raise_for_status()
             with open(temp_path, "wb") as f:
@@ -468,16 +503,28 @@ def download_file_verified(url, dest_path, expected_sha256):
         verify_checksum(temp_path, expected_sha256)
         log_info(f"Checksum verified: {dest_path}")
 
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
 
-        os.replace(temp_path, dest_path)
+            os.replace(temp_path, dest_path)
 
-        if os.name != "nt" and dest_path.endswith(".AppImage"):
-            try:
-                os.chmod(dest_path, 0o755)
-            except Exception as e:
-                log_error(f"Failed setting executable bit on {dest_path}: {e}")
+            if os.name != "nt" and dest_path.endswith(".AppImage"):
+                try:
+                    os.chmod(dest_path, 0o755)
+                except Exception as e:
+                    log_error(f"Failed setting executable bit on {dest_path}: {e}")
+        except OSError as exc:
+            if not should_prefer_privilege_fallback(config) or not should_attempt_privilege_fallback(exc):
+                raise
+
+            copy_path_with_privilege_fallback(
+                temp_path,
+                dest_path,
+                config,
+                f"install update payload {dest_path}",
+                make_executable=os.name != "nt" and dest_path.endswith(".AppImage"),
+            )
 
     except Exception:
         if os.path.exists(temp_path):
@@ -628,6 +675,156 @@ def run_command_checked(command, timeout=30, context=None, log_path=None):
         raise RuntimeError(f"{context} failed with exit code {result.returncode}")
 
     return result
+
+
+def should_prefer_privilege_fallback(config):
+    return bool((config or {}).get("runAsRoot"))
+
+
+def has_interactive_terminal():
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def build_shell_command(command):
+    return " ".join(shlex.quote(str(part)) for part in command)
+
+
+def should_attempt_privilege_fallback(exc_or_result):
+    text = str(
+        getattr(exc_or_result, "message", None)
+        or getattr(exc_or_result, "stderr", None)
+        or getattr(exc_or_result, "stdout", None)
+        or exc_or_result
+        or ""
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "eacces",
+            "eperm",
+            "permission denied",
+            "operation not permitted",
+            "authentication is required",
+            "must be root",
+            "read-only file system",
+            "not permitted",
+        )
+    )
+
+
+def run_command_with_privilege_fallback(
+    command,
+    config,
+    timeout=30,
+    context=None,
+    log_path=None,
+    always_elevate_on_failure=False,
+):
+    result = run_command_capture(command, timeout=timeout)
+
+    context = context or format_command(command)
+    stdout = truncate_for_log(result.stdout)
+    stderr = truncate_for_log(result.stderr)
+    if stdout:
+        log_info(f"{context} stdout: {stdout}")
+        if log_path:
+            append_helper_bootstrap_log(log_path, f"{context} stdout: {stdout}")
+    if stderr:
+        if result.returncode == 0:
+            log_info(f"{context} stderr: {stderr}")
+        else:
+            log_error(f"{context} stderr: {stderr}")
+        if log_path:
+            append_helper_bootstrap_log(log_path, f"{context} stderr: {stderr}")
+
+    if result.returncode == 0:
+        return result
+
+    if not should_prefer_privilege_fallback(config):
+        raise RuntimeError(f"{context} failed with exit code {result.returncode}")
+
+    if not always_elevate_on_failure and not should_attempt_privilege_fallback(result):
+        raise RuntimeError(f"{context} failed with exit code {result.returncode}")
+
+    if os.name == "nt":
+        raise RuntimeError(f"{context} failed with exit code {result.returncode}")
+
+    candidates = []
+    if sys.platform.startswith("linux"):
+        candidates.append(["sudo", "-n", *command])
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            candidates.append(["pkexec", *command])
+        if has_interactive_terminal():
+            candidates.append(["sudo", *command])
+    elif sys.platform == "darwin":
+        candidates.append(["sudo", "-n", *command])
+        shell_command = build_shell_command(command)
+        candidates.append(
+            [
+                "osascript",
+                "-e",
+                'do shell script "' + shell_command.replace('\\', '\\\\').replace('"', '\\"') + '" with administrator privileges',
+            ]
+        )
+        if has_interactive_terminal():
+            candidates.append(["sudo", *command])
+
+    last_error = f"{context} failed with exit code {result.returncode}"
+    for candidate in candidates:
+        elevated = run_command_capture(candidate, timeout=timeout)
+        elevated_stdout = truncate_for_log(elevated.stdout)
+        elevated_stderr = truncate_for_log(elevated.stderr)
+        if elevated_stdout:
+            log_info(f"{format_command(candidate)} stdout: {elevated_stdout}")
+            if log_path:
+                append_helper_bootstrap_log(log_path, f"{format_command(candidate)} stdout: {elevated_stdout}")
+        if elevated_stderr:
+            if elevated.returncode == 0:
+                log_info(f"{format_command(candidate)} stderr: {elevated_stderr}")
+            else:
+                log_error(f"{format_command(candidate)} stderr: {elevated_stderr}")
+            if log_path:
+                append_helper_bootstrap_log(log_path, f"{format_command(candidate)} stderr: {elevated_stderr}")
+
+        if elevated.returncode == 0:
+            return elevated
+
+        last_error = elevated_stderr or elevated_stdout or last_error
+
+    raise RuntimeError(last_error)
+
+
+def copy_path_with_privilege_fallback(
+    source_path,
+    destination_path,
+    config,
+    context,
+    make_executable=False,
+    timeout=120,
+):
+    if os.name == "nt":
+        shutil.copy2(source_path, destination_path)
+        return
+
+    shell_parts = [
+        f"mkdir -p {shlex.quote(os.path.dirname(destination_path))}",
+        f"cp {shlex.quote(source_path)} {shlex.quote(destination_path)}",
+    ]
+    if make_executable:
+        shell_parts.append(f"chmod 0755 {shlex.quote(destination_path)}")
+    else:
+        shell_parts.append(f"chmod 0644 {shlex.quote(destination_path)}")
+
+    run_command_with_privilege_fallback(
+        ["/bin/sh", "-lc", " && ".join(shell_parts)],
+        config,
+        timeout=timeout,
+        context=context,
+        always_elevate_on_failure=True,
+    )
 
 
 def spawn_detached(command, cwd=None, env=None):
@@ -2334,7 +2531,7 @@ def install_update(os_type, manifest):
             url = resolve_file_download_url(manifest, version_path, file_info)
             dest = os.path.join(install_path, *rel_path.split("/"))
 
-            download_file_verified(url, dest, expected_sha256)
+            download_file_verified(url, dest, expected_sha256, config=config)
             downloaded_files.append(dest)
             if component_name == "dashboard_gui":
                 downloaded_dashboard_files.append(dest)
@@ -2350,7 +2547,18 @@ def install_update(os_type, manifest):
         log_info("Updating client_service files at serviceInstallPath")
     
         service_client_dir = os.path.join(service_path, "client_service")
-        os.makedirs(service_client_dir, exist_ok=True)
+        try:
+            os.makedirs(service_client_dir, exist_ok=True)
+        except OSError as exc:
+            if not should_prefer_privilege_fallback(config) or not should_attempt_privilege_fallback(exc):
+                raise
+            run_command_with_privilege_fallback(
+                ["/bin/sh", "-lc", f"mkdir -p {shlex.quote(service_client_dir)}"],
+                config,
+                timeout=60,
+                context=f"create service client directory {service_client_dir}",
+                always_elevate_on_failure=True,
+            )
     
         for file_info in components["client_service"].get("files", []):
             rel_path = file_info["relative_path"].replace("\\", "/").lstrip("/")
@@ -2366,28 +2574,40 @@ def install_update(os_type, manifest):
             if not os.path.exists(src_file):
                 raise RuntimeError(f"Source file missing for service sync: {src_file}")
     
-            os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-    
-            temp_dst = dst_file + ".download"
-            shutil.copy2(src_file, temp_dst)
-    
-            if os.path.exists(dst_file):
-                os.remove(dst_file)
-    
-            os.replace(temp_dst, dst_file)
+            try:
+                os.makedirs(os.path.dirname(dst_file), exist_ok=True)
 
-            if os_type == "linux" and dst_file.endswith(".AppImage"):
-                try:
-                    os.chmod(dst_file, 0o755)
-                except Exception as e:
-                    log_error(f"Failed setting executable bit on synced service file {dst_file}: {e}")
+                temp_dst = dst_file + ".download"
+                shutil.copy2(src_file, temp_dst)
+
+                if os.path.exists(dst_file):
+                    os.remove(dst_file)
+
+                os.replace(temp_dst, dst_file)
+
+                if os_type == "linux" and dst_file.endswith(".AppImage"):
+                    try:
+                        os.chmod(dst_file, 0o755)
+                    except Exception as e:
+                        log_error(f"Failed setting executable bit on synced service file {dst_file}: {e}")
+            except OSError as exc:
+                if not should_prefer_privilege_fallback(config) or not should_attempt_privilege_fallback(exc):
+                    raise
+
+                copy_path_with_privilege_fallback(
+                    src_file,
+                    dst_file,
+                    config,
+                    f"sync service file {dst_file}",
+                    make_executable=os_type == "linux" and dst_file.endswith(".AppImage"),
+                )
     
             log_info(f"Replaced service file -> {dst_file}")
 
             config_paths_to_update.append(os.path.join(service_path, "client_config.json"))
 
         for config_path in dict.fromkeys(config_paths_to_update):
-            update_config_version_at_path(config_path, latest_version)
+            update_config_version_at_path(config_path, latest_version, config=config)
         
     return downloaded_files
 
