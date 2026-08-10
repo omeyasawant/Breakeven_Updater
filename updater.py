@@ -139,17 +139,24 @@ def resolve_config_path():
     2. ./client_config.json beside updater
     3. installPath/client_config.json if discoverable later
     """
-    candidates = [
-        os.path.normpath(os.path.join(RUNTIME_BASE_DIR, "..", "client_config.json")),
-        os.path.normpath(os.path.join(RUNTIME_BASE_DIR, "client_config.json")),
-    ]
+    search_roots = [RUNTIME_BASE_DIR, os.getcwd()]
+    candidates = []
+
+    for root in search_roots:
+        current = os.path.abspath(root)
+        for _ in range(6):
+            candidates.append(os.path.join(current, "client_config.json"))
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
 
     for candidate in candidates:
         if os.path.exists(candidate):
-            return candidate
+            return os.path.normpath(candidate)
 
     # default to the original intended relative path even if not found yet
-    return candidates[0]
+    return os.path.normpath(os.path.join(RUNTIME_BASE_DIR, "..", "client_config.json"))
 
 
 CONFIG_PATH = resolve_config_path()
@@ -159,7 +166,40 @@ CONFIG_PATH = resolve_config_path()
 
 
 BASE_DIR = RUNTIME_BASE_DIR
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+
+def resolve_log_dir():
+    candidates = []
+
+    if platform.system().lower() == "darwin":
+        candidates.append(os.path.join(os.path.expanduser("~"), "Library", "Logs", "BreakEvenClient"))
+
+    config_dir = os.path.dirname(os.path.abspath(CONFIG_PATH)) if CONFIG_PATH else ""
+    if config_dir:
+        candidates.append(os.path.join(config_dir, "logs"))
+
+    candidates.append(os.path.join(os.getcwd(), "logs"))
+
+    candidates.append(os.path.join(BASE_DIR, "logs"))
+
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        if os.path.isdir(normalized):
+            return normalized
+
+        parent = os.path.dirname(normalized) or normalized
+        if os.path.isdir(parent) and os.access(parent, os.W_OK):
+            return normalized
+
+    return os.path.normpath(candidates[-1])
+
+
+LOG_DIR = resolve_log_dir()
 LOG_PATH = os.path.join(LOG_DIR, "updater.log")
 
 
@@ -2235,6 +2275,28 @@ def create_helper_copy(config, runtime_state=None):
 
     source_path = resolve_current_program_source_path(runtime_state=runtime_state)
     helper_name = os.path.basename(source_path)
+
+    if platform.system().lower() == "darwin":
+        current = os.path.abspath(source_path)
+        while True:
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            if current.endswith(".app") and os.path.isdir(current):
+                helper_app_path = os.path.join(helper_dir, os.path.basename(current))
+                shutil.copytree(current, helper_app_path, symlinks=True)
+                helper_exec_path = os.path.join(
+                    helper_app_path,
+                    "Contents",
+                    "MacOS",
+                    os.path.basename(source_path),
+                )
+                try:
+                    os.chmod(helper_exec_path, 0o755)
+                except Exception:
+                    pass
+                return helper_dir, helper_exec_path
+            current = parent
 
     if getattr(sys, "frozen", False):
         stem, ext = os.path.splitext(helper_name)
