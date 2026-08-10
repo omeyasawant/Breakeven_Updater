@@ -827,6 +827,16 @@ def copy_path_with_privilege_fallback(
     )
 
 
+def install_macos_pkg_with_privilege_fallback(package_path, config, context, timeout=600):
+    run_command_with_privilege_fallback(
+        ["/usr/sbin/installer", "-pkg", package_path, "-target", "/"],
+        config,
+        timeout=timeout,
+        context=context,
+        always_elevate_on_failure=True,
+    )
+
+
 def spawn_detached(command, cwd=None, env=None):
     return subprocess.Popen(
         command,
@@ -2573,6 +2583,16 @@ def install_update(os_type, manifest):
     
             if not os.path.exists(src_file):
                 raise RuntimeError(f"Source file missing for service sync: {src_file}")
+
+            if os_type == "macos" and src_file.endswith(".pkg"):
+                install_macos_pkg_with_privilege_fallback(
+                    src_file,
+                    config,
+                    f"install macOS service package {src_file}",
+                )
+                log_info(f"Installed macOS service package -> {src_file}")
+                config_paths_to_update.append(os.path.join(service_path, "client_config.json"))
+                continue
     
             try:
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
