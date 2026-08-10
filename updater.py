@@ -88,6 +88,79 @@ WINDOWS_DETACHED_FLAGS = (
 LAST_UP_TO_DATE_LOG_DATE = None
 
 
+def resolve_existing_path(paths):
+    seen = set()
+    for candidate in paths:
+        if not candidate:
+            continue
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.exists(normalized):
+            return normalized
+    return None
+
+
+def service_manifest_search_roots(config):
+    service_root = config.get("serviceInstallPath")
+    install_root = config.get("installPath")
+
+    if platform.system().lower() == "darwin" and service_root:
+        service_manifest_dir = os.path.join(service_root, "client_service")
+        if any(
+            os.path.exists(os.path.join(service_manifest_dir, manifest_name))
+            for manifest_name in SERVICE_MANIFEST_FILES
+        ):
+            return [os.path.normpath(service_root)]
+
+    roots = []
+    for candidate in [service_root, install_root]:
+        if not candidate:
+            continue
+        normalized = os.path.normpath(candidate)
+        if normalized not in roots:
+            roots.append(normalized)
+    return roots
+
+
+def runtime_coordination_root_candidates(config):
+    candidates = []
+    if platform.system().lower() == "darwin":
+        candidates.append(os.path.join("/Users", "Shared", "BreakEvenClient"))
+
+    candidates.extend([
+        config.get("serviceInstallPath"),
+        config.get("installPath"),
+        RUNTIME_BASE_DIR,
+    ])
+
+    resolved = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(normalized)
+    return resolved
+
+
+def resolve_runtime_coordination_root(config):
+    fallback_root = os.path.join(RUNTIME_BASE_DIR, "updater_runtime")
+    for base_root in runtime_coordination_root_candidates(config):
+        runtime_root = os.path.join(base_root, "updater_runtime")
+        try:
+            os.makedirs(runtime_root, exist_ok=True)
+            if os.access(runtime_root, os.W_OK):
+                return runtime_root
+        except Exception:
+            continue
+    return os.path.normpath(fallback_root)
+
+
 def write_bootstrap_trace(message):
     bootstrap_log_path = os.environ.get(HELPER_BOOTSTRAP_LOG_ENV)
     if not bootstrap_log_path:
@@ -1126,7 +1199,7 @@ def load_service_manifest_record(manifest_path):
 
 
 def discover_service_manifest_records(config):
-    roots = [config.get("installPath"), config.get("serviceInstallPath")]
+    roots = service_manifest_search_roots(config)
     records = []
     seen_keys = set()
 
@@ -1350,12 +1423,29 @@ def resolve_dashboard_candidate(install_path):
     elif os_type == "macos":
         candidates = [
             os.path.join(dashboard_dir, "BreakEven.app"),
-            os.path.join(dashboard_dir, "BreakEven.dmg"),
+            os.path.join(dashboard_dir, "BreakEven Dashboard.app"),
+            os.path.join(dashboard_dir, "breakevendashboard.app"),
+            os.path.join("/Applications", "BreakEven.app"),
+            os.path.join("/Applications", "BreakEven Dashboard.app"),
+            os.path.join("/Applications", "breakevendashboard.app"),
+            os.path.join(os.path.expanduser("~"), "Applications", "BreakEven.app"),
+            os.path.join(os.path.expanduser("~"), "Applications", "BreakEven Dashboard.app"),
+            os.path.join(os.path.expanduser("~"), "Applications", "breakevendashboard.app"),
         ]
 
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
+
+    if os_type == "macos" and os.path.isdir(dashboard_dir):
+        try:
+            for entry in os.listdir(dashboard_dir):
+                if entry.lower().endswith(".app"):
+                    candidate = os.path.join(dashboard_dir, entry)
+                    if os.path.isdir(candidate):
+                        return candidate
+        except Exception:
+            pass
 
     if os_type == "linux":
         return resolve_linux_dashboard_launch_command(dashboard_dir)
@@ -2190,11 +2280,6 @@ def launch_dashboard_if_present(config):
                 log_info(f"Dashboard relaunched from {launch_target}")
                 return True
 
-            if launch_target and os.path.exists(launch_target) and launch_target.endswith(".dmg"):
-                spawn_detached(["open", launch_target], cwd=dashboard_dir)
-                log_info(f"Dashboard disk image reopened from {launch_target}")
-                return True
-
             log_info(f"No macOS dashboard artifact found in {dashboard_dir}")
             return False
 
@@ -2236,15 +2321,13 @@ def launch_dashboard_if_present(config):
 
 
 def get_helper_runtime_root(config):
-    base_root = config.get("serviceInstallPath") or config.get("installPath") or RUNTIME_BASE_DIR
-    runtime_root = os.path.join(base_root, "updater_runtime")
+    runtime_root = resolve_runtime_coordination_root(config)
     os.makedirs(runtime_root, exist_ok=True)
     return runtime_root
 
 
 def get_dashboard_relaunch_request_path(config):
-    request_root = config.get("installPath") or config.get("serviceInstallPath") or RUNTIME_BASE_DIR
-    runtime_root = os.path.join(request_root, "updater_runtime")
+    runtime_root = resolve_runtime_coordination_root(config)
     os.makedirs(runtime_root, exist_ok=True)
     return os.path.join(runtime_root, "dashboard_relaunch_request.json")
 
