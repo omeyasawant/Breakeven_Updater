@@ -125,15 +125,14 @@ def service_manifest_search_roots(config):
 
 
 def runtime_coordination_root_candidates(config):
-    candidates = []
-    if platform.system().lower() == "darwin":
-        candidates.append(os.path.join("/Users", "Shared", "BreakEvenClient"))
-
-    candidates.extend([
+    candidates = [
         config.get("serviceInstallPath"),
         config.get("installPath"),
         RUNTIME_BASE_DIR,
-    ])
+    ]
+
+    if platform.system().lower() == "darwin":
+        candidates.append(os.path.join("/Users", "Shared", "BreakEvenClient"))
 
     resolved = []
     seen = set()
@@ -1124,6 +1123,11 @@ def launch_helper_process(command, helper_dir, helper_env):
 
     if sys.platform.startswith("linux"):
         return launch_helper_via_systemd(command, helper_dir, helper_env)
+
+    if sys.platform == "darwin":
+        launcher_path = create_posix_helper_launcher(helper_dir, command, helper_env)
+        proc = spawn_detached(["/bin/bash", launcher_path], cwd=helper_dir, env=helper_env)
+        return {"task_name": None, "pid": proc.pid, "launcher_path": launcher_path}
 
     proc = spawn_detached(command, cwd=helper_dir, env=helper_env)
     return {"task_name": None, "pid": proc.pid}
@@ -2488,6 +2492,9 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
     runtime_root = get_helper_runtime_root(config)
     state_path = os.path.join(helper_dir, "update_state.json")
     bootstrap_log_path = os.path.join(helper_dir, "helper_bootstrap.log")
+    log_info(f"Preparing detached updater helper in {helper_dir}")
+    log_info(f"Helper executable path resolved to {helper_path}")
+    log_info(f"Helper bootstrap log will be written to {bootstrap_log_path}")
     state = {
         "manifest": manifest,
         "local_version": local_version,
@@ -2517,6 +2524,8 @@ def launch_update_helper(manifest, local_version, latest_version, os_type, confi
     write_bootstrap_trace(f"Preparing helper launch from {helper_path}")
     append_helper_bootstrap_log(bootstrap_log_path, f"Parent preparing helper launch | state={state_path}")
     helper_launch = launch_helper_process(command, helper_dir, helper_env)
+    if helper_launch.get("launcher_path"):
+        log_info(f"Helper launcher path: {helper_launch['launcher_path']}")
     state["helper_task_name"] = helper_launch.get("task_name")
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f)
