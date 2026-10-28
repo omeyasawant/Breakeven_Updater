@@ -209,23 +209,33 @@ RUNTIME_BASE_DIR = get_runtime_base_dir()
 def resolve_config_path():
     """
     Priority:
-    1. ../client_config.json relative to updater location
-    2. ./client_config.json beside updater
+    1. ../client_config.json relative to updater location (the service root
+       config, e.g. serviceInstallPath/client_config.json)
+    2. ./client_config.json beside updater (legacy copy kept in sync by the
+       installer/updater)
     3. installPath/client_config.json if discoverable later
+
+    The parent config is preferred over the one beside the executable so the
+    service root config stays the single source of truth for the version.
     """
     search_roots = [RUNTIME_BASE_DIR, os.getcwd()]
-    candidates = []
+    parent_candidates = []
+    local_candidates = []
 
     for root in search_roots:
         current = os.path.abspath(root)
-        for _ in range(6):
-            candidates.append(os.path.join(current, "client_config.json"))
+        for depth in range(6):
+            candidate = os.path.join(current, "client_config.json")
+            if depth == 0:
+                local_candidates.append(candidate)
+            else:
+                parent_candidates.append(candidate)
             parent = os.path.dirname(current)
             if parent == current:
                 break
             current = parent
 
-    for candidate in candidates:
+    for candidate in parent_candidates + local_candidates:
         if os.path.exists(candidate):
             return os.path.normpath(candidate)
 
