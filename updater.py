@@ -404,6 +404,55 @@ def update_config_version_at_path(config_path, new_version, config=None):
     log_info(f"Updated version to {new_version} in {config_path}")
 
 
+def verify_config_version_at_path(config_path, expected_version):
+    """Re-read a config file and confirm its version matches what was written."""
+    if not config_path or not os.path.exists(config_path):
+        log_error(f"Version verification failed, config file missing: {config_path}")
+        return False
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            actual_version = json.load(f).get("version")
+    except Exception as exc:
+        log_error(f"Version verification failed, could not read {config_path}: {exc}")
+        return False
+
+    if actual_version == expected_version:
+        log_info(f"Verified version {expected_version} in {config_path}")
+        return True
+
+    log_error(
+        f"Version verification failed in {config_path}: "
+        f"expected {expected_version}, found {actual_version}"
+    )
+    return False
+
+
+def update_and_verify_config_versions(config_paths, new_version, config=None):
+    """Write the new version to every config path, then verify each one.
+
+    Raises if the config the updater itself reads (CONFIG_PATH) does not
+    verify, so a failed write cannot silently cause an endless update loop.
+    """
+    for config_path in dict.fromkeys(config_paths):
+        update_config_version_at_path(config_path, new_version, config=config)
+
+    failed_paths = []
+    for config_path in dict.fromkeys(config_paths):
+        if not verify_config_version_at_path(config_path, new_version):
+            failed_paths.append(config_path)
+
+    if failed_paths:
+        message = (
+            f"Version verification failed for: {', '.join(failed_paths)}"
+        )
+        if os.path.normpath(CONFIG_PATH) in [os.path.normpath(p) for p in failed_paths]:
+            raise RuntimeError(
+                message + " (includes the config this updater reads; aborting to avoid an update loop)"
+            )
+        log_error(message)
+
+
 # In[ ]:
 
 
@@ -2707,7 +2756,14 @@ def install_update(os_type, manifest):
     if os_type == "linux":
         reinstall_linux_dashboard_if_needed(selected_linux_dashboard_target, downloaded_dashboard_files)
 
-    config_paths_to_update = [os.path.join(install_path, "client_config.json")]
+    config_paths_to_update = [
+        os.path.join(install_path, "client_config.json"),
+        CONFIG_PATH,
+    ]
+    if service_path:
+        config_paths_to_update.append(
+            os.path.join(service_path, "client_service", "client_config.json")
+        )
 
     if "client_service" in components and service_path:
         log_info("Updating client_service files at serviceInstallPath")
@@ -2782,9 +2838,10 @@ def install_update(os_type, manifest):
 
             config_paths_to_update.append(os.path.join(service_path, "client_config.json"))
 
-        for config_path in dict.fromkeys(config_paths_to_update):
-            update_config_version_at_path(config_path, latest_version, config=config)
-        
+        update_and_verify_config_versions(
+            config_paths_to_update, latest_version, config=config
+        )
+
     return downloaded_files
 
 
