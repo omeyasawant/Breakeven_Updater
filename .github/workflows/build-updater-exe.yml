@@ -132,7 +132,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash -l {0}
         run: |
-          python -m PyInstaller --onefile updater.py             --name Breakeven_Updater             --hidden-import psutil             --hidden-import requests             --hidden-import packaging
+          python -m PyInstaller --onefile updater.py             --name Breakeven_Updater             --icon icon.ico             --hidden-import psutil             --hidden-import requests             --hidden-import packaging
 
       - name: Build (macOS .pkg)
         if: runner.os == 'macOS'
@@ -168,7 +168,7 @@ jobs:
           )
 
           # Build an x86_64 app bundle (runs on Intel and on Apple Silicon via Rosetta)
-          python -m PyInstaller --onedir --windowed updater.py             --name Breakeven_Updater             --hidden-import psutil             --hidden-import requests             --hidden-import packaging             "${PYINSTALLER_MAC_ARGS[@]}"
+          python -m PyInstaller --onedir --windowed updater.py             --name Breakeven_Updater             --icon icon.icns             --hidden-import psutil             --hidden-import requests             --hidden-import packaging             "${PYINSTALLER_MAC_ARGS[@]}"
 
           echo "== Verifying Breakeven_Updater.app signature =="
           codesign --verify --deep --strict --verbose=2 "dist/Breakeven_Updater.app"
@@ -242,10 +242,7 @@ jobs:
           Terminal=true
           EOF
 
-          # Minimal 1x1 PNG icon (base64)
-          base64 -d > AppDir/Breakeven_Updater.png << 'EOF'
-          iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGD4DwABBAEAHnLrWQAAAABJRU5ErkJggg==
-          EOF
+          cp icon.png AppDir/Breakeven_Updater.png
 
           # AppRun launcher
           cat > AppDir/AppRun << 'EOF'
