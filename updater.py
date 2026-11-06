@@ -67,6 +67,12 @@ MANIFEST_URL_DEFAULT = f"{DOWNLOAD_BASE_DEFAULT}/{MANIFEST_NAME}"
 CHECK_INTERVAL = 3600
 UPDATE_START_DELAY_SECONDS = 120
 
+# Helper directory cleanup: finished helpers delete their own runtime copy
+# after a short delay; the service sweep removes whatever is left behind.
+HELPER_DIR_CLEANUP_DELAY_SECONDS = 15
+HELPER_DIR_ORPHAN_AGE_SECONDS = 6 * 3600
+HELPER_SWEEP_INTERVAL_SECONDS = 24 * 3600
+
 HELPER_STATE_ARG = "--apply-update-state"
 RUNTIME_BASE_ENV = "BREAKEVEN_UPDATER_RUNTIME_BASE"
 HELPER_STATE_ENV = "BREAKEVEN_UPDATER_STATE_PATH"
@@ -2465,6 +2471,83 @@ def create_helper_copy(config, runtime_state=None):
     return helper_dir, helper_path
 
 
+def schedule_helper_dir_cleanup(helper_dir, delay_seconds=HELPER_DIR_CLEANUP_DELAY_SECONDS):
+    """Delete a finished helper directory after the helper process exits.
+
+    A running executable cannot delete itself (Windows locks the file), so a
+    detached command waits briefly and then removes the whole directory tree.
+    """
+    if not helper_dir or not os.path.isdir(helper_dir):
+        return
+    try:
+        if os.name == "nt":
+            wait_ticks = max(2, int(delay_seconds))
+            command = (
+                f"cmd.exe /c ping 127.0.0.1 -n {wait_ticks} >nul & "
+                f'rmdir /s /q "{helper_dir}"'
+            )
+            spawn_detached(command)
+        else:
+            spawn_detached([
+                "/bin/sh",
+                "-c",
+                f"sleep {int(delay_seconds)}; rm -rf {shlex.quote(helper_dir)}",
+            ])
+        log_info(f"Scheduled cleanup of helper directory {helper_dir}")
+    except Exception as e:
+        log_error(f"Failed to schedule cleanup of helper directory {helper_dir}: {e}")
+
+
+def cleanup_stale_helper_dirs(config, orphan_age_seconds=HELPER_DIR_ORPHAN_AGE_SECONDS):
+    """Remove helper directories left behind by finished or orphaned helpers.
+
+    A helper directory still containing update_state.json may belong to a
+    helper that is currently running, so it is kept unless it is older than
+    orphan_age_seconds. Everything else under updater_runtime/helper_* is
+    safe to delete.
+    """
+    current_dir = os.path.normpath(os.path.dirname(os.path.abspath(
+        sys.executable if getattr(sys, "frozen", False) else __file__
+    )))
+    now = time.time()
+    swept_roots = set()
+
+    for base_root in runtime_coordination_root_candidates(config):
+        runtime_root = os.path.normpath(os.path.join(base_root, "updater_runtime"))
+        if runtime_root in swept_roots or not os.path.isdir(runtime_root):
+            continue
+        swept_roots.add(runtime_root)
+
+        try:
+            entries = os.listdir(runtime_root)
+        except Exception:
+            continue
+
+        for entry in entries:
+            if not entry.startswith("helper_"):
+                continue
+            helper_dir = os.path.normpath(os.path.join(runtime_root, entry))
+            if not os.path.isdir(helper_dir) or helper_dir == current_dir:
+                continue
+
+            state_path = os.path.join(helper_dir, "update_state.json")
+            try:
+                dir_age = now - os.path.getmtime(helper_dir)
+            except Exception:
+                continue
+            if os.path.exists(state_path) and dir_age < orphan_age_seconds:
+                continue
+
+            try:
+                shutil.rmtree(helper_dir, ignore_errors=True)
+                if os.path.exists(helper_dir):
+                    log_error(f"Could not fully remove stale helper directory {helper_dir}")
+                else:
+                    log_info(f"Removed stale helper directory {helper_dir}")
+            except Exception as e:
+                log_error(f"Failed to remove stale helper directory {helper_dir}: {e}")
+
+
 def get_helper_marker_path(config=None, helper_state=None):
     if helper_state and helper_state.get("runtime_root"):
         runtime_root = helper_state["runtime_root"]
@@ -2709,6 +2792,7 @@ def run_helper_update_job(state_path):
             os.remove(state_path)
         except Exception:
             pass
+        schedule_helper_dir_cleanup(os.path.dirname(os.path.abspath(state_path)))
 
 
 # In[ ]:
@@ -2971,8 +3055,16 @@ if __name__ == "__main__":
         run_helper_update_job(helper_state_path)
     else:
         log_info("Updater service started")
+        last_helper_sweep = 0.0
 
         while True:
+            if time.time() - last_helper_sweep >= HELPER_SWEEP_INTERVAL_SECONDS:
+                try:
+                    cleanup_stale_helper_dirs(get_config())
+                except Exception as sweep_error:
+                    log_error(f"Helper directory sweep failed: {sweep_error}")
+                last_helper_sweep = time.time()
+
             manifest = fetch_manifest()
             manifest = run_update_cycle(manifest)
 
